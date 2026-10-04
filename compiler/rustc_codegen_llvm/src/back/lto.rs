@@ -92,10 +92,7 @@ fn prepare_lto(
     // with either fat or thin LTO
     let mut upstream_modules = Vec::new();
     for path in each_linked_rlib_for_lto {
-        let archive_data = unsafe {
-            Mmap::map(std::fs::File::open(&path).expect("couldn't open rlib"))
-                .expect("couldn't map rlib")
-        };
+        let archive_data = unsafe { Mmap::map_artifact(&path).expect("couldn't map rlib") };
         let archive = ArchiveFile::parse(&*archive_data).expect("wanted an rlib");
         let metadata_link = rmeta_link::read(&archive, &archive_data, &path).unwrap();
         let obj_files = archive
@@ -520,7 +517,12 @@ fn thin_lto(
         // Save the current ThinLTO import information for the next compilation
         // session, overwriting the previous serialized data (if any).
         if let Some(path) = key_map_path
-            && let Err(err) = curr_key_map.save_to_file(&path)
+            && let Err(err) = curr_key_map.save_to_file(&path).and_then(|()| {
+                if let Some(options) = cgcx.incremental_compression_options() {
+                    rustc_data_structures::artifact_compression::pack_with_options(&path, options)?;
+                }
+                Ok(())
+            })
         {
             write::llvm_err(dcx, LlvmError::WriteThinLtoKey { err });
         }
@@ -794,19 +796,29 @@ struct ThinLTOKeysMap {
 impl ThinLTOKeysMap {
     fn save_to_file(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
+
+        // The current incremental session may contain hard links to the previous one. Remove this
+        // session's name before `create_buffered` opens the file with truncation, so updating the
+        // key map does not modify the previous session's cache entry.
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+
         let mut writer = File::create_buffered(path)?;
         // The entries are loaded back into a hash map in `load_from_file()`, so
         // the order in which we write them to file here does not matter.
         for (module, key) in &self.keys {
             writeln!(writer, "{module} {key}")?;
         }
-        Ok(())
+        writer.flush()
     }
 
     fn load_from_file(path: &Path) -> io::Result<Self> {
         use std::io::BufRead;
         let mut keys = BTreeMap::default();
-        let file = File::open_buffered(path)?;
+        let file = io::Cursor::new(rustc_data_structures::artifact_compression::read_all(path)?);
         for line in file.lines() {
             let line = line?;
             let mut split = line.split(' ');

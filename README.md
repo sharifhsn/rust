@@ -1,3 +1,10 @@
+## Target size research
+
+This fork contains experimental Rust build storage work. Read [the results and implementation guide](TARGET-SIZE.md).
+The guide links the separate Cargo and Wild forks and measured source snapshots.
+
+---
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rust-lang/www.rust-lang.org/master/static/images/rust-social-wide-dark.svg">

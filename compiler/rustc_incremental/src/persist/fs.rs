@@ -47,8 +47,10 @@
 //! the compiler also does some garbage collection each time it is started in
 //! incremental compilation mode. Specifically, it will scan the incremental
 //! compilation directory for private session directories that are not in use
-//! any more and will delete those. It will also delete any finalized session
-//! directories for a given crate except for the most recent one.
+//! any more and will delete those. It also deletes every finalized session
+//! except the current one. A newer generation is fully published before older
+//! generations are collected, so failed builds leave the previous generation
+//! available while a new one is being produced.
 //!
 //! ## Synchronization
 //!
@@ -308,6 +310,15 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
 
     let incr_comp_session_dir: PathBuf = sess.incr_comp_session_dir().clone();
 
+    // The earlier staging-file rename does not finish the graph encoder. Its footer is
+    // written by the subsequent finish_encoding call. Only pack here, after encoding and codegen have
+    // completed, and before publishing the finalized session to other compiler processes.
+    super::file_format::compress_incremental_artifact(
+        sess,
+        &dep_graph_path(sess),
+        "compress_incremental_records",
+    );
+
     debug!("finalize_session_directory() - session directory: {}", incr_comp_session_dir.display());
 
     let mut sub_dir_name = incr_comp_session_dir
@@ -345,7 +356,9 @@ pub fn finalize_session_directory(sess: &Session, svh: Option<Svh>) {
     // This unlocks the directory
     sess.finalize_incr_comp_session();
 
-    let _ = garbage_collect_session_directories(sess, &new_path);
+    if new_path.is_dir() {
+        let _ = garbage_collect_session_directories(sess, &new_path, false);
+    }
 }
 
 pub(crate) fn delete_all_session_dir_contents(sess: &Session) -> io::Result<()> {
@@ -586,6 +599,7 @@ fn is_old_enough_to_be_collected(timestamp: SystemTime) -> bool {
 pub(crate) fn garbage_collect_session_directories(
     sess: &Session,
     session_directory: &Path,
+    preserve_newest_finalized: bool,
 ) -> io::Result<()> {
     debug!("garbage_collect_session_directories() - begin");
 
@@ -812,8 +826,18 @@ pub(crate) fn garbage_collect_session_directories(
         });
     let deletion_candidates = deletion_candidates.into();
 
-    // Delete all but the most recent of the candidates
-    all_except_most_recent(deletion_candidates).into_items().all(|(path, lock)| {
+    // Setup-time collection runs before a new build has published, so it must
+    // keep the latest source generation available to concurrent compilers.
+    // Once a new generation is finalized, every older cache is disposable: any
+    // compiler that started from one has copied its inputs into its own locked
+    // working directory. Missing or corrupt incremental data only costs a
+    // rebuild, so retaining a fallback generation wastes space.
+    let deletion_candidates = if preserve_newest_finalized {
+        all_except_most_recent(deletion_candidates)
+    } else {
+        all_finalized_candidates(deletion_candidates)
+    };
+    deletion_candidates.into_items().all(|(path, lock)| {
         debug!("garbage_collect_session_directories() - deleting `{}`", path.display());
 
         if let Err(err) = std_fs::remove_dir_all(&path) {
@@ -841,20 +865,21 @@ fn delete_old(sess: &Session, path: &Path) {
     }
 }
 
+fn all_finalized_candidates(
+    deletion_candidates: UnordMap<(SystemTime, PathBuf), Option<flock::Lock>>,
+) -> UnordMap<PathBuf, Option<flock::Lock>> {
+    deletion_candidates.into_items().map(|((_, path), lock)| (path, lock)).collect()
+}
+
 fn all_except_most_recent(
     deletion_candidates: UnordMap<(SystemTime, PathBuf), Option<flock::Lock>>,
 ) -> UnordMap<PathBuf, Option<flock::Lock>> {
     let most_recent = deletion_candidates.items().map(|(&(timestamp, _), _)| timestamp).max();
-
-    if let Some(most_recent) = most_recent {
-        deletion_candidates
-            .into_items()
-            .filter(|&((timestamp, _), _)| timestamp != most_recent)
-            .map(|((_, path), lock)| (path, lock))
-            .collect()
-    } else {
-        UnordMap::default()
-    }
+    deletion_candidates
+        .into_items()
+        .filter(|&((timestamp, _), _)| Some(timestamp) != most_recent)
+        .map(|((_, path), lock)| (path, lock))
+        .collect()
 }
 
 fn safe_remove_file(p: &Path) -> io::Result<()> {

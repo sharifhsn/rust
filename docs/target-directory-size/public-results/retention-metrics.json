@@ -1,0 +1,1424 @@
+{
+  "schema": 1,
+  "scope": "Cargo retention; separate experiments from compiler/Wild compression",
+  "debug_level": 2,
+  "incremental": true,
+  "warm_samples_per_arm_per_operation": 5,
+  "warm_resolution_limit_ms": 50,
+  "full_workspace_concurrency": false,
+  "windows_native_lifetime": false,
+  "cargo_base": "4f3fb2428282fb2467c4bb5be0163d2f42a31491",
+  "retention_patch_sha256": "c74be69ecb97bf6c78fbf4a36d3782700836d1ed6501aabf62b85e4434103ff4",
+  "large_driver_sha256": "d78056f55dd137aecfcce9fa481c57ebea6ea6f42b8128d8c0ca49a78e8658e1",
+  "receipt_root_sha256": {
+    "bevy_polars_nushell": "79a91846b618b33d7d25204ace89c70412cb13196cfdcc3048881e3373328d00",
+    "ruff_uv": "90caedbed4849aaad331745b64223a4646a27937ef7976af1b71298327cd6a57"
+  },
+  "projects": {
+    "bevy": {
+      "configurations": 6,
+      "allocation_census": {
+        "control": {
+          "bytes": 107887087616,
+          "original_command_bytes": 107887087616,
+          "later_census_delta_bytes": 0
+        },
+        "active": {
+          "bytes": 37167771648,
+          "original_command_bytes": 37167771648,
+          "later_census_delta_bytes": 0
+        }
+      },
+      "timings": {
+        "control": {
+          "build_seconds": 2542.8279593789994,
+          "history_seconds_excluding_observed_pair": 3722.9526059649997
+        },
+        "active": {
+          "build_seconds": 2538.5157857779977,
+          "history_seconds_excluding_observed_pair": 3721.2438385589976
+        }
+      },
+      "warm": {
+        "check": {
+          "samples": {
+            "control": [
+              0.5651341590000811,
+              0.6152520900013769,
+              0.6151876559997618,
+              0.6152376059999369,
+              0.6152699020003638
+            ],
+            "active": [
+              0.665266320000228,
+              0.6653015429983498,
+              0.665349980999963,
+              0.6654803809997247,
+              0.6653205330003402
+            ]
+          },
+          "median_seconds": {
+            "control": 0.6152376059999369,
+            "active": 0.6653205330003402
+          },
+          "delta_ms": 50.08292700040329
+        },
+        "build": {
+          "samples": {
+            "control": [
+              0.5652009810000891,
+              0.565140912998686,
+              0.5651030630015157,
+              0.5150476610015176,
+              0.5651224579996779
+            ],
+            "active": [
+              0.5651051040003949,
+              0.5650773750003282,
+              0.565174602001207,
+              0.5650975109983847,
+              0.5651191940014542
+            ]
+          },
+          "median_seconds": {
+            "control": 0.5651224579996779,
+            "active": 0.5651051040003949
+          },
+          "delta_ms": -0.01735399928293191
+        },
+        "test": {
+          "samples": {
+            "control": [
+              0.5651454669987288,
+              0.5650741339995875,
+              0.5651130180012842,
+              0.5651057600007334,
+              0.5652113010000903
+            ],
+            "active": [
+              0.5650965360000555,
+              0.5651230850016873,
+              0.5651400679998915,
+              0.5651114150005014,
+              0.5651451319990883
+            ]
+          },
+          "median_seconds": {
+            "control": 0.5651130180012842,
+            "active": 0.5651230850016873
+          },
+          "delta_ms": 0.01006700040306896
+        },
+        "clippy": {
+          "samples": {
+            "control": [
+              0.6653603039994778,
+              0.6653308229997492,
+              0.6652912179997656,
+              0.6652953660013736,
+              0.665279187998749
+            ],
+            "active": [
+              0.7154812690005201,
+              0.7154645779992279,
+              0.715393722999579,
+              0.7154340569995838,
+              0.7153913239999383
+            ]
+          },
+          "median_seconds": {
+            "control": 0.6652953660013736,
+            "active": 0.7154340569995838
+          },
+          "delta_ms": 50.13869099821022
+        }
+      },
+      "commands": 126,
+      "successful_commands": 123,
+      "runtime_oracles": 19,
+      "expected_failures": [
+        {
+          "label": "upstream-backtrace-baseline",
+          "arm": "control",
+          "log": "0116-bevy-control-default-upstream-backtrace-baseline"
+        },
+        {
+          "label": "upstream-backtrace-baseline",
+          "arm": "active",
+          "log": "0119-bevy-active-default-upstream-backtrace-baseline"
+        },
+        {
+          "label": "expected-compile-failure",
+          "arm": "active",
+          "log": "0122-bevy-active-native-target-expected-compile-failure"
+        }
+      ],
+      "upstream_suites": [
+        {
+          "arm": "control",
+          "log": "0117-bevy-control-default-actual-tests",
+          "test_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 890 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out; finished in 0.51s"
+          ]
+        },
+        {
+          "arm": "active",
+          "log": "0120-bevy-active-default-actual-tests",
+          "test_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 890 passed; 0 failed; 2 ignored; 0 measured; 1 filtered out; finished in 0.51s"
+          ]
+        }
+      ],
+      "reuse": [
+        {
+          "name": "default",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 129.96070776100078,
+              "fresh": 0,
+              "artifacts": 461
+            },
+            {
+              "label": "build",
+              "seconds": 244.85866858699956,
+              "fresh": 111,
+              "artifacts": 461
+            },
+            {
+              "label": "test",
+              "seconds": 55.91392091299895,
+              "fresh": 459,
+              "artifacts": 462
+            }
+          ]
+        },
+        {
+          "name": "development-features",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 101.44281227700048,
+              "fresh": 413,
+              "artifacts": 469
+            },
+            {
+              "label": "build",
+              "seconds": 211.42908903900025,
+              "fresh": 413,
+              "artifacts": 469
+            },
+            {
+              "label": "test",
+              "seconds": 61.522854410000946,
+              "fresh": 467,
+              "artifacts": 470
+            }
+          ]
+        },
+        {
+          "name": "portable-v2",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 133.06183075300032,
+              "fresh": 0,
+              "artifacts": 469
+            },
+            {
+              "label": "build",
+              "seconds": 248.66056806399865,
+              "fresh": 111,
+              "artifacts": 469
+            },
+            {
+              "label": "test",
+              "seconds": 60.26980690200071,
+              "fresh": 467,
+              "artifacts": 470
+            }
+          ]
+        },
+        {
+          "name": "optimized-dev",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 122.79846921999888,
+              "fresh": 111,
+              "artifacts": 469
+            },
+            {
+              "label": "build",
+              "seconds": 592.720629821999,
+              "fresh": 111,
+              "artifacts": 469
+            },
+            {
+              "label": "test",
+              "seconds": 121.11267526200027,
+              "fresh": 467,
+              "artifacts": 470
+            }
+          ]
+        },
+        {
+          "name": "native-dev",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 136.1180268400003,
+              "fresh": 0,
+              "artifacts": 470
+            },
+            {
+              "label": "build",
+              "seconds": 620.5314919150005,
+              "fresh": 112,
+              "artifacts": 470
+            },
+            {
+              "label": "test",
+              "seconds": 125.15685289599969,
+              "fresh": 468,
+              "artifacts": 471
+            }
+          ]
+        },
+        {
+          "name": "native-target",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 139.07655872599935,
+              "fresh": 0,
+              "artifacts": 470
+            },
+            {
+              "label": "build",
+              "seconds": 620.3153383509998,
+              "fresh": 112,
+              "artifacts": 470
+            },
+            {
+              "label": "test",
+              "seconds": 126.25424458199996,
+              "fresh": 468,
+              "artifacts": 471
+            }
+          ]
+        }
+      ],
+      "return": {
+        "control": {
+          "seconds": 31.974423264000507,
+          "fresh": 460,
+          "artifacts": 461
+        },
+        "active": {
+          "seconds": 263.3159029339986,
+          "fresh": 0,
+          "artifacts": 461
+        }
+      }
+    },
+    "polars": {
+      "configurations": 3,
+      "allocation_census": {
+        "control": {
+          "bytes": 28591640576,
+          "original_command_bytes": 28591628288,
+          "later_census_delta_bytes": 12288
+        },
+        "active": {
+          "bytes": 10557833216,
+          "original_command_bytes": 10557829120,
+          "later_census_delta_bytes": 4096
+        }
+      },
+      "timings": {
+        "control": {
+          "build_seconds": 407.35326053399695,
+          "history_seconds_excluding_observed_pair": 630.3215299959957
+        },
+        "active": {
+          "build_seconds": 406.59547967100116,
+          "history_seconds_excluding_observed_pair": 631.3435930460018
+        }
+      },
+      "warm": {
+        "check": {
+          "samples": {
+            "control": [
+              0.41667707699889434,
+              0.4166997620013717,
+              0.4166528069999913,
+              0.4165801859999192,
+              0.41659290799907467
+            ],
+            "active": [
+              0.46502132100067683,
+              0.46529930799988506,
+              0.4650213069999154,
+              0.46503259999917645,
+              0.4650966879999032
+            ]
+          },
+          "median_seconds": {
+            "control": 0.4166528069999913,
+            "active": 0.46503259999917645
+          },
+          "delta_ms": 48.379792999185156
+        },
+        "build": {
+          "samples": {
+            "control": [
+              0.41644792199986114,
+              0.41636799600019003,
+              0.41687013899900194,
+              0.4163773379987106,
+              0.4165277199990669
+            ],
+            "active": [
+              0.416354543000125,
+              0.41657350000059523,
+              0.41656154399970546,
+              0.4165359959988564,
+              0.41650323499925435
+            ]
+          },
+          "median_seconds": {
+            "control": 0.41644792199986114,
+            "active": 0.4165359959988564
+          },
+          "delta_ms": 0.08807399899524171
+        },
+        "test": {
+          "samples": {
+            "control": [
+              0.41645748400151206,
+              0.41634918700037815,
+              0.4166435420011112,
+              0.41657806699913635,
+              0.4165696320014831
+            ],
+            "active": [
+              0.4165322120006749,
+              0.4165309870004421,
+              0.41655315900061396,
+              0.41645338699891,
+              0.4166055610003241
+            ]
+          },
+          "median_seconds": {
+            "control": 0.4165696320014831,
+            "active": 0.4165322120006749
+          },
+          "delta_ms": -0.037420000808197074
+        },
+        "clippy": {
+          "samples": {
+            "control": [
+              0.4649915930003772,
+              0.5151335110003856,
+              0.46495135799887066,
+              0.46490690499922493,
+              0.5151622479988873
+            ],
+            "active": [
+              0.5151005179995991,
+              0.5150623119989177,
+              0.5150729639990459,
+              0.5150842880011623,
+              0.5151965069999278
+            ]
+          },
+          "median_seconds": {
+            "control": 0.4649915930003772,
+            "active": 0.5150842880011623
+          },
+          "delta_ms": 50.09269500078517
+        }
+      },
+      "commands": 100,
+      "successful_commands": 99,
+      "runtime_oracles": 13,
+      "expected_failures": [
+        {
+          "label": "expected-compile-failure",
+          "arm": "active",
+          "log": "0222-polars-active-frame-pointers-expected-compile-failure"
+        }
+      ],
+      "upstream_suites": [
+        {
+          "arm": "control",
+          "log": "0218-polars-control-default-actual-tests",
+          "test_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          ]
+        },
+        {
+          "arm": "active",
+          "log": "0220-polars-active-default-actual-tests",
+          "test_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          ]
+        }
+      ],
+      "reuse": [
+        {
+          "name": "default",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 72.97221050600092,
+              "fresh": 0,
+              "artifacts": 367
+            },
+            {
+              "label": "build",
+              "seconds": 134.3190040949994,
+              "fresh": 110,
+              "artifacts": 367
+            },
+            {
+              "label": "test",
+              "seconds": 2.5182612569988123,
+              "fresh": 365,
+              "artifacts": 366
+            }
+          ]
+        },
+        {
+          "name": "portable-v2",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 73.3370239069991,
+              "fresh": 0,
+              "artifacts": 367
+            },
+            {
+              "label": "build",
+              "seconds": 135.41828256900044,
+              "fresh": 110,
+              "artifacts": 367
+            },
+            {
+              "label": "test",
+              "seconds": 1.3668353520006349,
+              "fresh": 365,
+              "artifacts": 366
+            }
+          ]
+        },
+        {
+          "name": "frame-pointers",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 73.28744314300093,
+              "fresh": 0,
+              "artifacts": 367
+            },
+            {
+              "label": "build",
+              "seconds": 136.85819300700132,
+              "fresh": 110,
+              "artifacts": 367
+            },
+            {
+              "label": "test",
+              "seconds": 1.2663392100002966,
+              "fresh": 365,
+              "artifacts": 366
+            }
+          ]
+        }
+      ],
+      "return": {
+        "control": {
+          "seconds": 24.608601758000077,
+          "fresh": 366,
+          "artifacts": 367
+        },
+        "active": {
+          "seconds": 157.3092969499994,
+          "fresh": 0,
+          "artifacts": 367
+        }
+      }
+    },
+    "nushell": {
+      "configurations": 3,
+      "allocation_census": {
+        "control": {
+          "bytes": 32353955840,
+          "original_command_bytes": 32353947648,
+          "later_census_delta_bytes": 8192
+        },
+        "active": {
+          "bytes": 12157448192,
+          "original_command_bytes": 12157444096,
+          "later_census_delta_bytes": 4096
+        }
+      },
+      "timings": {
+        "control": {
+          "build_seconds": 354.75976694100063,
+          "history_seconds_excluding_observed_pair": 934.6833726069963
+        },
+        "active": {
+          "build_seconds": 355.1225246929971,
+          "history_seconds_excluding_observed_pair": 935.8739562139963
+        }
+      },
+      "warm": {
+        "check": {
+          "samples": {
+            "control": [
+              0.6653273769989028,
+              0.6653101920019253,
+              0.665308579998964,
+              0.6653050610002538,
+              0.6653343469988613
+            ],
+            "active": [
+              0.7156119969986321,
+              0.7154353170008108,
+              0.7153748620003171,
+              0.7154357690014876,
+              0.7153754320024746
+            ]
+          },
+          "median_seconds": {
+            "control": 0.6653101920019253,
+            "active": 0.7154353170008108
+          },
+          "delta_ms": 50.12512499888544
+        },
+        "build": {
+          "samples": {
+            "control": [
+              0.6652406030007114,
+              0.6653197100022226,
+              0.6652810270024929,
+              0.6652710319976904,
+              0.6652657249978802
+            ],
+            "active": [
+              0.715409450000152,
+              0.7152909319993341,
+              0.715363843999512,
+              0.7153294750023633,
+              0.7154045600000245
+            ]
+          },
+          "median_seconds": {
+            "control": 0.6652710319976904,
+            "active": 0.715363843999512
+          },
+          "delta_ms": 50.092812001821585
+        },
+        "test": {
+          "samples": {
+            "control": [
+              0.6151960250026605,
+              0.6151543330015556,
+              0.615191438999318,
+              0.6151807259993802,
+              0.6152048389994889
+            ],
+            "active": [
+              0.6652890619989194,
+              0.6653317460004473,
+              0.6652904940019653,
+              0.6652943680019234,
+              0.665348646001803
+            ]
+          },
+          "median_seconds": {
+            "control": 0.615191438999318,
+            "active": 0.6652943680019234
+          },
+          "delta_ms": 50.10292900260538
+        },
+        "clippy": {
+          "samples": {
+            "control": [
+              0.7157413889981399,
+              0.7153520279971417,
+              0.7155357869996806,
+              0.7154645459995663,
+              0.7153841200015449
+            ],
+            "active": [
+              0.7655841160012642,
+              0.765566497000691,
+              0.7655386429978535,
+              0.7654924070011475,
+              0.7655071190019953
+            ]
+          },
+          "median_seconds": {
+            "control": 0.7154645459995663,
+            "active": 0.7655386429978535
+          },
+          "delta_ms": 50.07409699828713
+        }
+      },
+      "commands": 100,
+      "successful_commands": 99,
+      "runtime_oracles": 13,
+      "expected_failures": [
+        {
+          "label": "expected-compile-failure",
+          "arm": "active",
+          "log": "0322-nushell-active-frame-pointers-expected-compile-failure"
+        }
+      ],
+      "upstream_suites": [
+        {
+          "arm": "control",
+          "log": "0318-nushell-control-default-actual-tests",
+          "test_results": [
+            "test result: ok. 279 passed; 0 failed; 0 ignored; 0 filtered out; across 1 groups, finished in 0.11s"
+          ]
+        },
+        {
+          "arm": "active",
+          "log": "0320-nushell-active-default-actual-tests",
+          "test_results": [
+            "test result: ok. 279 passed; 0 failed; 0 ignored; 0 filtered out; across 1 groups, finished in 0.10s"
+          ]
+        }
+      ],
+      "reuse": [
+        {
+          "name": "default",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 94.23545385400212,
+              "fresh": 0,
+              "artifacts": 806
+            },
+            {
+              "label": "build",
+              "seconds": 117.5891909790007,
+              "fresh": 295,
+              "artifacts": 806
+            },
+            {
+              "label": "test",
+              "seconds": 98.37198553100097,
+              "fresh": 503,
+              "artifacts": 759
+            }
+          ]
+        },
+        {
+          "name": "portable-v2",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 94.56430662799903,
+              "fresh": 0,
+              "artifacts": 806
+            },
+            {
+              "label": "build",
+              "seconds": 118.20860866799921,
+              "fresh": 295,
+              "artifacts": 806
+            },
+            {
+              "label": "test",
+              "seconds": 98.83249233399692,
+              "fresh": 503,
+              "artifacts": 759
+            }
+          ]
+        },
+        {
+          "name": "frame-pointers",
+          "commands": [
+            {
+              "label": "check",
+              "seconds": 95.24557138700038,
+              "fresh": 0,
+              "artifacts": 806
+            },
+            {
+              "label": "build",
+              "seconds": 119.32472504599718,
+              "fresh": 295,
+              "artifacts": 806
+            },
+            {
+              "label": "test",
+              "seconds": 99.50162178699975,
+              "fresh": 503,
+              "artifacts": 759
+            }
+          ]
+        }
+      ],
+      "return": {
+        "control": {
+          "seconds": 22.705436267999175,
+          "fresh": 805,
+          "artifacts": 806
+        },
+        "active": {
+          "seconds": 172.80707049000193,
+          "fresh": 0,
+          "artifacts": 806
+        }
+      }
+    },
+    "ruff": {
+      "configurations": 3,
+      "commands": 101,
+      "successful_commands": 99,
+      "runtime_oracles": 13,
+      "expected_failures": 1,
+      "warm": {
+        "check": {
+          "samples": {
+            "control": [
+              0.3647514060000958,
+              0.3646783400001823,
+              0.3646899450000092,
+              0.3647258900000452,
+              0.3647102750001068
+            ],
+            "active": [
+              0.4148474690000512,
+              0.41482177899979433,
+              0.41476514400005726,
+              0.41476739800009454,
+              0.36471028200003275
+            ]
+          },
+          "median_seconds": {
+            "control": 0.3647102750001068,
+            "active": 0.41476739800009454
+          },
+          "delta_ms": 50.05712299998777
+        },
+        "build": {
+          "samples": {
+            "control": [
+              0.36479421699982595,
+              0.36468884000009893,
+              0.3180768279999029,
+              0.36469958199995745,
+              0.3178317629999583
+            ],
+            "active": [
+              0.36474787699989974,
+              0.36474922700017487,
+              0.36468056700005036,
+              0.3646984389999943,
+              0.36465204499995707
+            ]
+          },
+          "median_seconds": {
+            "control": 0.36468884000009893,
+            "active": 0.3646984389999943
+          },
+          "delta_ms": 0.00959899989538826
+        },
+        "test": {
+          "samples": {
+            "control": [
+              0.36476365099997565,
+              0.3647291889999451,
+              0.36471285199991144,
+              0.3646981719998621,
+              0.3646692410000014
+            ],
+            "active": [
+              0.36481815000001916,
+              0.41480160799983423,
+              0.36470519499994225,
+              0.36471566399995936,
+              0.36466494199999033
+            ]
+          },
+          "median_seconds": {
+            "control": 0.36471285199991144,
+            "active": 0.36471566399995936
+          },
+          "delta_ms": 0.002812000047924812
+        },
+        "clippy": {
+          "samples": {
+            "control": [
+              0.4148355330000868,
+              0.41469373500012807,
+              0.41477486000007957,
+              0.4148632540000108,
+              0.41473298899995825
+            ],
+            "active": [
+              0.464873789999956,
+              0.4648834199999783,
+              0.41478084400000625,
+              0.4147777649998261,
+              0.4147744489998786
+            ]
+          },
+          "median_seconds": {
+            "control": 0.41477486000007957,
+            "active": 0.41478084400000625
+          },
+          "delta_ms": 0.0059839999266841915
+        }
+      },
+      "trace": [
+        {
+          "name": "default",
+          "features": null,
+          "flags": "",
+          "opt": "0",
+          "assertions": "true"
+        },
+        {
+          "name": "portable-v2",
+          "features": null,
+          "flags": "-Ctarget-cpu=x86-64-v2",
+          "opt": "0",
+          "assertions": "true"
+        },
+        {
+          "name": "frame-pointers",
+          "features": null,
+          "flags": "-Cforce-frame-pointers=yes",
+          "opt": "0",
+          "assertions": "true"
+        }
+      ],
+      "history": {
+        "control": {
+          "seconds": 358.111577969,
+          "allocation_census": {
+            "bytes": 15784587264,
+            "original_command_bytes": 15784587264,
+            "later_census_delta_bytes": 0
+          },
+          "categories": {
+            "other": 11027525632,
+            "incremental": 4757061632
+          },
+          "unit_count": 2097,
+          "sampled_tree_rss_peak": 5120790528,
+          "sampled_tree_fds_peak": 269,
+          "fresh_by_configuration": [
+            {
+              "name": "default",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 40.90830415100004,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 47.23331273299999,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.11951404199999,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            },
+            {
+              "name": "portable-v2",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 40.50729964300001,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 47.53363973400002,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.013170653999964,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            },
+            {
+              "name": "frame-pointers",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 40.71437979899997,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 47.61338910699999,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.46856810600002,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            }
+          ]
+        },
+        "active": {
+          "seconds": 360.3096895360004,
+          "allocation_census": {
+            "bytes": 6053765120,
+            "original_command_bytes": 6053761024,
+            "later_census_delta_bytes": 4096
+          },
+          "categories": {
+            "other": 3563614208,
+            "incremental": 2490011648,
+            "session-state": 135168
+          },
+          "unit_count": 699,
+          "sampled_tree_rss_peak": 5165654016,
+          "sampled_tree_fds_peak": 317,
+          "fresh_by_configuration": [
+            {
+              "name": "default",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 40.758898207000016,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 47.009416585000054,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.21258949500009,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            },
+            {
+              "name": "portable-v2",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 40.86497329600002,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 48.330071730999975,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.515890850999995,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            },
+            {
+              "name": "frame-pointers",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 41.073220503000016,
+                  "fresh": 0,
+                  "artifacts": 379
+                },
+                {
+                  "label": "build",
+                  "seconds": 48.52970198900016,
+                  "fresh": 118,
+                  "artifacts": 379
+                },
+                {
+                  "label": "test",
+                  "seconds": 31.014926879000086,
+                  "fresh": 370,
+                  "artifacts": 392
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "return": {
+        "control": {
+          "seconds": 5.073489396000014,
+          "fresh": 377,
+          "artifacts": 379
+        },
+        "active": {
+          "seconds": 61.72297637399993,
+          "fresh": 0,
+          "artifacts": 379
+        }
+      },
+      "saved_fraction_from_census": 0.6164761853604588,
+      "active_root_allocation": {
+        "session_live": 6053486592,
+        "output_only": 0,
+        "execution_only": 0,
+        "known_inactive": 0,
+        "outside_known_units": 278528,
+        "total": 6053765120
+      }
+    },
+    "uv": {
+      "configurations": 3,
+      "commands": 100,
+      "successful_commands": 99,
+      "runtime_oracles": 13,
+      "expected_failures": 1,
+      "warm": {
+        "check": {
+          "samples": {
+            "control": [
+              0.5650980779992096,
+              0.5651616889999787,
+              0.5650903750001817,
+              0.5651152550008192,
+              0.5650996889999078
+            ],
+            "active": [
+              0.6152823999991597,
+              0.6151648680006474,
+              0.6151452819995029,
+              0.6151878849996137,
+              0.6153652200000579
+            ]
+          },
+          "median_seconds": {
+            "control": 0.5650996889999078,
+            "active": 0.6151878849996137
+          },
+          "delta_ms": 50.08819599970593
+        },
+        "build": {
+          "samples": {
+            "control": [
+              0.5651410640002723,
+              0.565178298000319,
+              0.5651316509993194,
+              0.5651629629992385,
+              0.56515999200019
+            ],
+            "active": [
+              0.6152577840002778,
+              0.5651191139995717,
+              0.5650383889997102,
+              0.5651186470004177,
+              0.6153109639999457
+            ]
+          },
+          "median_seconds": {
+            "control": 0.56515999200019,
+            "active": 0.5651191139995717
+          },
+          "delta_ms": -0.040878000618249644
+        },
+        "test": {
+          "samples": {
+            "control": [
+              0.5650994500001616,
+              0.5651590919997034,
+              0.5651459359996807,
+              0.5652165800001967,
+              0.5651713110000856
+            ],
+            "active": [
+              0.615204091999658,
+              0.6152773160001743,
+              0.5649659929995323,
+              0.5650472739998804,
+              0.6152039329999752
+            ]
+          },
+          "median_seconds": {
+            "control": 0.5651590919997034,
+            "active": 0.6152039329999752
+          },
+          "delta_ms": 50.044841000271845
+        },
+        "clippy": {
+          "samples": {
+            "control": [
+              0.6152132090001032,
+              0.615172402999633,
+              0.6151474640000743,
+              0.6152379909999581,
+              0.6152892920008526
+            ],
+            "active": [
+              0.6652515460000359,
+              0.6653018180004437,
+              0.6150725749994308,
+              0.615111756999795,
+              0.6652787719995104
+            ]
+          },
+          "median_seconds": {
+            "control": 0.6152132090001032,
+            "active": 0.6652515460000359
+          },
+          "delta_ms": 50.03833699993265
+        }
+      },
+      "trace": [
+        {
+          "name": "default",
+          "features": null,
+          "flags": "",
+          "opt": "0",
+          "assertions": "true"
+        },
+        {
+          "name": "portable-v2",
+          "features": null,
+          "flags": "-Ctarget-cpu=x86-64-v2",
+          "opt": "0",
+          "assertions": "true"
+        },
+        {
+          "name": "frame-pointers",
+          "features": null,
+          "flags": "-Cforce-frame-pointers=yes",
+          "opt": "0",
+          "assertions": "true"
+        }
+      ],
+      "history": {
+        "control": {
+          "seconds": 681.0481886939997,
+          "allocation_census": {
+            "bytes": 30660554752,
+            "original_command_bytes": 30660554752,
+            "later_census_delta_bytes": 0
+          },
+          "categories": {
+            "other": 20392906752,
+            "incremental": 10267648000
+          },
+          "unit_count": 3594,
+          "sampled_tree_rss_peak": 5588979712,
+          "sampled_tree_fds_peak": 287,
+          "fresh_by_configuration": [
+            {
+              "name": "default",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 60.65327082499971,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 93.3135217250001,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 70.3856644729999,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            },
+            {
+              "name": "portable-v2",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 63.24091128000009,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 94.545922281,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 70.99413606099961,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            },
+            {
+              "name": "frame-pointers",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 61.58919248400025,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 94.7338116410001,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 71.59175792399992,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            }
+          ]
+        },
+        "active": {
+          "seconds": 700.7585452770004,
+          "allocation_census": {
+            "bytes": 11929358336,
+            "original_command_bytes": 11929358336,
+            "later_census_delta_bytes": 0
+          },
+          "categories": {
+            "other": 6648205312,
+            "incremental": 5280935936,
+            "session-state": 217088
+          },
+          "unit_count": 1198,
+          "sampled_tree_rss_peak": 5546737664,
+          "sampled_tree_fds_peak": 336,
+          "fresh_by_configuration": [
+            {
+              "name": "default",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 61.276221436000014,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 94.41455960400026,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 71.18925917900015,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            },
+            {
+              "name": "portable-v2",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 62.7741843509998,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 94.86853510400033,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 71.39017540600025,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            },
+            {
+              "name": "frame-pointers",
+              "commands": [
+                {
+                  "label": "check",
+                  "seconds": 65.32746823699972,
+                  "fresh": 0,
+                  "artifacts": 607
+                },
+                {
+                  "label": "build",
+                  "seconds": 101.40258136500006,
+                  "fresh": 149,
+                  "artifacts": 607
+                },
+                {
+                  "label": "test",
+                  "seconds": 78.1155605949998,
+                  "fresh": 561,
+                  "artifacts": 636
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "return": {
+        "control": {
+          "seconds": 6.328115835000062,
+          "fresh": 606,
+          "artifacts": 607
+        },
+        "active": {
+          "seconds": 123.92780416200003,
+          "fresh": 0,
+          "artifacts": 607
+        }
+      },
+      "saved_fraction_from_census": 0.6109216407696654,
+      "active_root_allocation": {
+        "session_live": 11929096192,
+        "output_only": 0,
+        "execution_only": 0,
+        "known_inactive": 0,
+        "outside_known_units": 262144,
+        "total": 11929358336
+      }
+    }
+  }
+}

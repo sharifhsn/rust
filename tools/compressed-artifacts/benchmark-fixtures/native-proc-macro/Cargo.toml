@@ -1,0 +1,15 @@
+[package]
+name = "compression-fixture"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[workspace]
+members = ["proc-macro"]
+resolver = "2"
+
+[lib]
+doctest = false
+
+[dependencies]
+fixture-attribute = { path = "proc-macro" }

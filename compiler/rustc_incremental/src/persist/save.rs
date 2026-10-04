@@ -41,6 +41,16 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
         sess.time("assert_dep_graph", || assert_dep_graph(tcx));
         sess.time("check_clean", || clean::check_clean_annotations(tcx));
 
+        // The paged dep graph assigns stable serialized IDs only after the
+        // current graph has been written. Finalize it before serializing the
+        // query-cache footer so its index tables use that same ID space.
+        let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
+        tcx.dep_graph.exec_cache_promotions(tcx);
+        on_disk_cache.close_serialized_data_mmap();
+        if let Err((path, err)) = tcx.dep_graph.finish_encoding() {
+            sess.dcx().emit_fatal(diagnostics::WriteNew { name: "dependency graph", path, err });
+        }
+
         par_join(
             move || {
                 sess.time("incr_comp_persist_dep_graph", || {
@@ -54,29 +64,7 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                 });
             },
             move || {
-                // We execute this after `incr_comp_persist_dep_graph` for the serial compiler
-                // to catch any potential query execution writing to the dep graph.
                 sess.time("incr_comp_persist_result_cache", || {
-                    // The on-disk cache struct is always present in incremental mode,
-                    // even if there was no previous session.
-                    let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
-
-                    // For every green dep node that has a disk-cached value from the
-                    // previous session, make sure the value is loaded into the memory
-                    // cache, so that it will be serialized as part of this session.
-                    //
-                    // This reads data from the previous session, so it needs to happen
-                    // before dropping the mmap.
-                    //
-                    // FIXME(Zalathar): This step is intended to be cheap, but still does
-                    // quite a lot of work, especially in builds with few or no changes.
-                    // Can we be smarter about how we identify values that need promotion?
-                    // Can we promote values without decoding them into the memory cache?
-                    tcx.dep_graph.exec_cache_promotions(tcx);
-
-                    // Drop the memory map so that we can remove the file and write to it.
-                    on_disk_cache.close_serialized_data_mmap();
-
                     file_format::save_in(sess, query_cache_path, "query cache", |encoder| {
                         tcx.sess.time("incr_comp_serialize_result_cache", || {
                             on_disk_cache::OnDiskCache::serialize(tcx, encoder)

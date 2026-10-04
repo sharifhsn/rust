@@ -1,7 +1,6 @@
 //! Reading of the rustc metadata for rlibs and dylibs
 
 use std::borrow::Cow;
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
@@ -45,10 +44,7 @@ fn load_metadata_with(
     path: &Path,
     f: impl for<'a> FnOnce(&'a [u8]) -> Result<&'a [u8], String>,
 ) -> Result<OwnedSlice, String> {
-    let file =
-        File::open(path).map_err(|e| format!("failed to open file '{}': {}", path.display(), e))?;
-
-    unsafe { Mmap::map(file) }
+    unsafe { Mmap::map_artifact(path) }
         .map_err(|e| format!("failed to mmap file '{}': {}", path.display(), e))
         .and_then(|mmap| try_slice_owned(mmap, |mmap| f(mmap)))
 }
@@ -56,6 +52,28 @@ fn load_metadata_with(
 impl MetadataLoader for DefaultMetadataLoader {
     fn get_rlib_metadata(&self, target: &Target, path: &Path) -> Result<OwnedSlice, String> {
         debug!("getting rlib metadata for {}", path.display());
+        {
+            use std::io::Read;
+
+            use rustc_data_structures::compact_artifact::library::{Library, MAGIC};
+            let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut magic = [0; 8];
+            if file.read_exact(&mut magic).is_ok() && &magic == MAGIC {
+                let library = Library::parse(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                let metadata =
+                    library.metadata_path(path).map_err(|e| e.to_string())?.ok_or_else(|| {
+                        format!("compact library `{}` has no metadata", path.display())
+                    })?;
+                let mmap = std::fs::File::open(&metadata)
+                    .and_then(|file| unsafe { Mmap::map(file) })
+                    .map_err(|e| e.to_string())?;
+                return Ok(rustc_data_structures::owned_slice::slice_owned(
+                    mmap,
+                    |bytes| &bytes[..],
+                ));
+            }
+        }
         load_metadata_with(path, |data| {
             let archive = object::read::archive::ArchiveFile::parse(&*data)
                 .map_err(|e| format!("failed to parse rlib '{}': {}", path.display(), e))?;

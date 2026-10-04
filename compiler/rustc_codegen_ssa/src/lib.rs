@@ -100,6 +100,12 @@ impl<M> ModuleCodegen<M> {
     ) -> CompiledModule {
         let object = emit_obj.then(|| outputs.temp_path_for_cgu(OutputType::Object, &self.name));
         let dwarf_object = emit_dwarf_obj.then(|| outputs.temp_path_dwo_for_cgu(&self.name));
+        if let Some(path) = &dwarf_object {
+            // Keep compressed sections within the compression ratio gdb accepts, by extending
+            // the file with a hole when needed. A failure only affects debugging, so it is
+            // ignored.
+            let _ = rustc_data_structures::compact_artifact::dwo::make_readable_by_bfd(path);
+        }
         let bytecode = emit_bc.then(|| outputs.temp_path_for_cgu(OutputType::Bitcode, &self.name));
         let assembly =
             emit_asm.then(|| outputs.temp_path_for_cgu(OutputType::Assembly, &self.name));

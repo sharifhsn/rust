@@ -932,18 +932,12 @@ fn get_metadata_section<'p>(
 }
 
 fn get_rmeta_metadata_section<'a, 'p>(filename: &'p Path) -> Result<OwnedSlice, MetadataError<'a>> {
-    // mmap the file, because only a small fraction of it is read.
-    let file = std::fs::File::open(filename).map_err(|_| {
+    // MetadataBlob reads compressed chunks on demand from the stored mapping.
+    let mmap = std::fs::File::open(filename).and_then(|file| unsafe { Mmap::map(file) });
+    let mmap = mmap.map_err(|err| {
         MetadataError::LoadFailure(format!(
-            "failed to open rmeta metadata: '{}'",
-            filename.display()
-        ))
-    })?;
-    let mmap = unsafe { Mmap::map(file) };
-    let mmap = mmap.map_err(|_| {
-        MetadataError::LoadFailure(format!(
-            "failed to mmap rmeta metadata: '{}'",
-            filename.display()
+            "failed to map rmeta metadata '{}': {err}",
+            filename.display(),
         ))
     })?;
 

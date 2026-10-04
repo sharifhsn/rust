@@ -325,3 +325,80 @@ fn test_flush_strategy() {
     assert_eq!(flushed, expected);
     assert_eq!(flushed, fs::read(&tmpfile).unwrap());
 }
+#[test]
+fn indexed_decoder_windows_and_crossing_borrows() {
+    use crate::Decoder;
+    use crate::opaque::{DecoderSource, MAGIC_END_BYTES, MemDecoder};
+    struct Source {
+        bytes: Vec<u8>,
+        width: usize,
+    }
+    impl DecoderSource for Source {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn read_at(&self, offset: usize, len: usize) -> &[u8] {
+            &self.bytes[offset..][..len]
+        }
+        fn window(&self, offset: usize) -> (usize, &[u8]) {
+            let start = offset / self.width * self.width;
+            (start, &self.bytes[start..self.bytes.len().min(start + self.width)])
+        }
+    }
+    let data: Vec<u8> = (0..251).chain(MAGIC_END_BYTES.iter().copied()).collect();
+    for width in 1..33 {
+        let source = Source { bytes: data.clone(), width };
+        let mut decoder = MemDecoder::from_source(&source, 0).unwrap();
+        for expected in 0..251 {
+            assert_eq!(decoder.peek_byte(), expected);
+            assert_eq!(decoder.read_u8(), expected);
+        }
+        assert_eq!(decoder.remaining(), 0);
+        let mut decoder = decoder.split_at(7);
+        let borrowed = decoder.read_raw_bytes(77);
+        assert_eq!(borrowed, &data[7..84]);
+        let address = borrowed.as_ptr();
+        decoder.with_position(200, |d| {
+            assert_eq!(d.read_raw_bytes(30), &data[200..230]);
+        });
+        assert_eq!(decoder.position(), 84);
+        assert_eq!(source.read_at(7, 77).as_ptr(), address);
+        assert_eq!(decoder.read_raw_bytes(167), &data[84..251]);
+        assert_eq!(decoder.remaining(), 0);
+    }
+}
+
+#[test]
+fn indexed_decoder_rejects_empty_windows_before_eof() {
+    use crate::Decoder;
+    use crate::opaque::{DecoderSource, MAGIC_END_BYTES, MemDecoder};
+    struct BrokenSource {
+        bytes: Vec<u8>,
+        empty_at: usize,
+    }
+    impl DecoderSource for BrokenSource {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+        fn read_at(&self, offset: usize, len: usize) -> &[u8] {
+            &self.bytes[offset..][..len]
+        }
+        fn window(&self, offset: usize) -> (usize, &[u8]) {
+            if offset == self.empty_at {
+                (offset, &[])
+            } else {
+                (offset, &self.bytes[offset..offset + 1])
+            }
+        }
+    }
+    for empty_at in [0, 1] {
+        let source =
+            BrokenSource { bytes: [b"abc".as_slice(), MAGIC_END_BYTES].concat(), empty_at };
+        let result = std::panic::catch_unwind(|| {
+            let mut decoder = MemDecoder::from_source(&source, 0).unwrap();
+            decoder.read_u8();
+            decoder.read_u8();
+        });
+        assert!(result.is_err(), "empty window at {empty_at} was accepted");
+    }
+}

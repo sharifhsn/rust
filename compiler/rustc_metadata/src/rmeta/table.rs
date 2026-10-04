@@ -524,7 +524,7 @@ where
         let width = self.width;
         let start = self.position.get() + (width * i.index());
         let end = start + width;
-        let bytes = &metadata.blob()[start..end];
+        let bytes = metadata.blob().range(start, end);
 
         if let Ok(fixed) = bytes.try_into() {
             FixedSizeEncoding::from_bytes(fixed)

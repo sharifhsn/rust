@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "cargo": {
+    "base": "4f3fb2428282fb2467c4bb5be0163d2f42a31491",
+    "isolation": "950bb0729f3a80377d5c47d24c4b03eb10b4fd5e",
+    "patch_sha256": "c74be69ecb97bf6c78fbf4a36d3782700836d1ed6501aabf62b85e4434103ff4"
+  },
+  "rust": {
+    "upstream_base": "d3ea0356830dc019038110eba0bc8f790aaef2e4",
+    "current_source": "dbe25b1d9f720009ee4b1f1d1cad80cc2d173dda",
+    "measured_source": "ccac5086ce6"
+  },
+  "wild": {
+    "current_source": "008132a46ca78235888210bd6c6687096c26858f",
+    "measured_source": "cc20455e"
+  },
+  "authorship": "LLM-assisted source and documentation, for personal-fork research review",
+  "method": "Published source blobs match the recorded source revision. Unrelated Cranelift and rust-analyzer changes are excluded."
+}

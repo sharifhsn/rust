@@ -273,15 +273,26 @@ impl Encoder for FileEncoder<'_> {
 // Decoder
 // -----------------------------------------------------------------------------
 
-// Conceptually, `MemDecoder` wraps a `&[u8]` with a cursor into it that is always valid.
-// This is implemented with three pointers, two which represent the original slice and a
-// third that is our cursor.
-// It is an invariant of this type that start <= current <= end.
-// Additionally, the implementation of this type never modifies start and end.
+// The three pointers describe the current contiguous window, with start <= current <= end.
+// Ordinary inputs use one window. Indexed inputs refill it on demand; `base` translates
+// window positions into logical offsets in the original metadata. The logical cursor
+// never exceeds `logical_len`, which excludes the validation footer.
+/// Logical byte source whose returned slices remain pinned for its lifetime.
+pub trait DecoderSource {
+    fn len(&self) -> usize;
+    fn read_at(&self, offset: usize, len: usize) -> &[u8];
+    /// A contiguous region containing `offset`, with its logical starting offset.
+    fn window(&self, offset: usize) -> (usize, &[u8]);
+}
+
+#[derive(Clone, Copy)]
 pub struct MemDecoder<'a> {
     start: *const u8,
     current: *const u8,
     end: *const u8,
+    source: Option<&'a dyn DecoderSource>,
+    base: usize,
+    logical_len: usize,
     _marker: PhantomData<&'a u8>,
 }
 
@@ -290,27 +301,74 @@ impl<'a> MemDecoder<'a> {
     pub fn new(data: &'a [u8], position: usize) -> Result<MemDecoder<'a>, ()> {
         let data = data.strip_suffix(MAGIC_END_BYTES).ok_or(())?;
         let Range { start, end } = data.as_ptr_range();
-        Ok(MemDecoder { start, current: data[position..].as_ptr(), end, _marker: PhantomData })
+        Ok(MemDecoder {
+            start,
+            current: data[position..].as_ptr(),
+            end,
+            source: None,
+            base: 0,
+            logical_len: data.len(),
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn from_source(source: &'a dyn DecoderSource, position: usize) -> Result<Self, ()> {
+        let logical_len = source.len().checked_sub(MAGIC_END_BYTES.len()).ok_or(())?;
+        if source.read_at(logical_len, MAGIC_END_BYTES.len()) != MAGIC_END_BYTES
+            || position > logical_len
+        {
+            return Err(());
+        }
+        let (base, data) = source.window(position);
+        assert!(base <= position);
+        let data = &data[..data.len().min(logical_len - base)];
+        assert!(position == logical_len || position - base < data.len());
+        let Range { start, end } = data.as_ptr_range();
+        Ok(Self {
+            start,
+            current: data[position - base..].as_ptr(),
+            end,
+            source: Some(source),
+            base,
+            logical_len,
+            _marker: PhantomData,
+        })
+    }
+
+    #[cold]
+    fn refill(&mut self, position: usize) {
+        let source = self.source.expect("contiguous decoder exhausted");
+        let (base, data) = source.window(position);
+        assert!(base <= position && position <= self.logical_len);
+        let data = &data[..data.len().min(self.logical_len - base)];
+        // A safe DecoderSource implementation must not make read_u8 dereference
+        // an empty window before EOF, even if it violates the window contract.
+        assert!(position == self.logical_len || position - base < data.len());
+        self.start = data.as_ptr();
+        self.current = data[position - base..].as_ptr();
+        self.end = data.as_ptr_range().end;
+        self.base = base;
     }
 
     #[inline]
     pub fn split_at(&self, position: usize) -> MemDecoder<'a> {
         assert!(position <= self.len());
+        if let Some(source) = self.source {
+            return Self::from_source(source, position).unwrap();
+        }
         // SAFETY: We checked above that this offset is within the original slice
         let current = unsafe { self.start.add(position) };
-        MemDecoder { start: self.start, current, end: self.end, _marker: PhantomData }
+        MemDecoder { current, ..*self }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        // SAFETY: This recovers the length of the original slice, only using members we never modify.
-        unsafe { self.end.offset_from_unsigned(self.start) }
+        self.logical_len
     }
 
     #[inline]
     pub fn remaining(&self) -> usize {
-        // SAFETY: This type guarantees current <= end.
-        unsafe { self.end.offset_from_unsigned(self.current) }
+        self.logical_len - self.position()
     }
 
     #[cold]
@@ -334,23 +392,20 @@ impl<'a> MemDecoder<'a> {
     {
         struct SetOnDrop<'a, 'guarded> {
             decoder: &'guarded mut MemDecoder<'a>,
-            current: *const u8,
+            previous: MemDecoder<'a>,
         }
         impl Drop for SetOnDrop<'_, '_> {
             fn drop(&mut self) {
-                self.decoder.current = self.current;
+                *self.decoder = self.previous;
             }
         }
 
         if pos >= self.len() {
             Self::decoder_exhausted();
         }
-        let previous = self.current;
-        // SAFETY: We just checked if this add is in-bounds above.
-        unsafe {
-            self.current = self.start.add(pos);
-        }
-        let guard = SetOnDrop { current: previous, decoder: self };
+        let replacement = self.split_at(pos);
+        let previous = std::mem::replace(self, replacement);
+        let guard = SetOnDrop { previous, decoder: self };
         func(guard.decoder)
     }
 }
@@ -378,7 +433,10 @@ impl<'a> Decoder for MemDecoder<'a> {
     #[inline]
     fn read_u8(&mut self) -> u8 {
         if self.current == self.end {
-            Self::decoder_exhausted();
+            if self.remaining() == 0 {
+                Self::decoder_exhausted();
+            }
+            self.refill(self.position());
         }
         // SAFETY: This type guarantees current <= end, and we just checked current == end.
         unsafe {
@@ -403,6 +461,15 @@ impl<'a> Decoder for MemDecoder<'a> {
         if bytes > self.remaining() {
             Self::decoder_exhausted();
         }
+        // SAFETY: both pointers are in the current pinned window.
+        let in_window = unsafe { self.end.offset_from_unsigned(self.current) };
+        if bytes > in_window {
+            let source = self.source.expect("contiguous range exceeds window");
+            let position = self.position();
+            let slice = source.read_at(position, bytes);
+            self.refill(position + bytes);
+            return slice;
+        }
         // SAFETY: We just checked if this range is in-bounds above.
         unsafe {
             let slice = std::slice::from_raw_parts(self.current, bytes);
@@ -414,7 +481,10 @@ impl<'a> Decoder for MemDecoder<'a> {
     #[inline]
     fn peek_byte(&self) -> u8 {
         if self.current == self.end {
-            Self::decoder_exhausted();
+            if self.remaining() == 0 {
+                Self::decoder_exhausted();
+            }
+            return self.source.unwrap().read_at(self.position(), 1)[0];
         }
         // SAFETY: This type guarantees current is inbounds or one-past-the-end, which is end.
         // Since we just checked current == end, the current pointer must be inbounds.
@@ -424,7 +494,7 @@ impl<'a> Decoder for MemDecoder<'a> {
     #[inline]
     fn position(&self) -> usize {
         // SAFETY: This type guarantees start <= current
-        unsafe { self.current.offset_from_unsigned(self.start) }
+        self.base + unsafe { self.current.offset_from_unsigned(self.start) }
     }
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn test_all_except_most_recent() {
+fn test_collect_all_finalized_generations() {
     let input: UnordMap<_, Option<flock::Lock>> = UnordMap::from_iter([
         ((UNIX_EPOCH + Duration::new(4, 0), PathBuf::from("4")), None),
         ((UNIX_EPOCH + Duration::new(1, 0), PathBuf::from("1")), None),
@@ -10,11 +10,30 @@ fn test_all_except_most_recent() {
         ((UNIX_EPOCH + Duration::new(2, 0), PathBuf::from("2")), None),
     ]);
     assert_eq!(
-        all_except_most_recent(input).into_items().map(|(path, _)| path).into_sorted_stable_ord(),
-        vec![PathBuf::from("1"), PathBuf::from("2"), PathBuf::from("3"), PathBuf::from("4")]
+        all_finalized_candidates(input).into_items().map(|(path, _)| path).into_sorted_stable_ord(),
+        vec![
+            PathBuf::from("1"),
+            PathBuf::from("2"),
+            PathBuf::from("3"),
+            PathBuf::from("4"),
+            PathBuf::from("5"),
+        ]
     );
 
-    assert!(all_except_most_recent(UnordMap::default()).is_empty());
+    assert!(all_finalized_candidates(UnordMap::default()).is_empty());
+}
+
+#[test]
+fn test_setup_gc_keeps_the_latest_published_generation() {
+    let input: UnordMap<_, Option<flock::Lock>> = UnordMap::from_iter([
+        ((UNIX_EPOCH + Duration::new(2, 0), PathBuf::from("2")), None),
+        ((UNIX_EPOCH + Duration::new(1, 0), PathBuf::from("1")), None),
+        ((UNIX_EPOCH + Duration::new(3, 0), PathBuf::from("3")), None),
+    ]);
+    assert_eq!(
+        all_except_most_recent(input).into_items().map(|(path, _)| path).into_sorted_stable_ord(),
+        vec![PathBuf::from("1"), PathBuf::from("2")]
+    );
 }
 
 #[test]

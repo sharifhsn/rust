@@ -46,7 +46,8 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
         .unwrap_or_else(|err| tcx.dcx().emit_fatal(FailedCreateTempdir { err }));
     let metadata_tmpdir = MaybeTempDir::new(metadata_tmpdir, tcx.sess.opts.cg.save_temps);
     let metadata_filename = metadata_tmpdir.as_ref().join("full.rmeta");
-    let metadata_stub_filename = if !tcx.sess.opts.unstable_opts.embed_metadata
+    let metadata_stub_filename = if (!tcx.sess.opts.unstable_opts.embed_metadata
+        || tcx.sess.opts.unstable_opts.compact_artifact_store.is_some())
         && !tcx.crate_types().contains(&CrateType::ProcMacro)
     {
         Some(metadata_tmpdir.as_ref().join("stub.rmeta"))
@@ -56,6 +57,21 @@ pub fn encode_and_write_metadata(tcx: TyCtxt<'_>) -> EncodedMetadata {
 
     if tcx.needs_metadata() {
         encode_metadata(tcx, &metadata_filename, metadata_stub_filename.as_deref());
+        if tcx.sess.opts.unstable_opts.compress_artifacts
+            || tcx.sess.opts.unstable_opts.compact_artifact_store.is_some()
+        {
+            tcx.sess
+                .time("compress_metadata", || {
+                    rustc_data_structures::artifact_compression::pack_with_options(
+                        &metadata_filename,
+                        tcx.sess.opts.unstable_opts.artifact_compression_options(),
+                    )
+                })
+                .unwrap_or_else(|err| {
+                    tcx.dcx()
+                        .emit_fatal(FailedWriteError { filename: metadata_filename.clone(), err });
+                });
+        }
     } else {
         // Always create a file at `metadata_filename`, even if we have nothing to write to it.
         // This simplifies the creation of the output `out_filename` when requested.

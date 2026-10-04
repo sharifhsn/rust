@@ -1,0 +1,28 @@
+# Native compiler prototype. Keep its build output separate from existing research.
+change-id = "ignore"
+
+[build]
+build = "aarch64-apple-darwin"
+host = ["aarch64-apple-darwin"]
+target = ["aarch64-apple-darwin"]
+build-dir = "/tmp/rust-compressed-artifacts-bootstrap"
+jobs = 6
+docs = false
+extended = false
+
+[llvm]
+download-ci-llvm = true
+assertions = false
+
+[rust]
+download-rustc = false
+channel = "dev"
+optimize = true
+debug-assertions = false
+debuginfo-level = 0
+incremental = false
+codegen-units = 16
+lld = false
+
+[target.aarch64-apple-darwin]
+rustflags = ["-Lnative=/opt/homebrew/lib"]

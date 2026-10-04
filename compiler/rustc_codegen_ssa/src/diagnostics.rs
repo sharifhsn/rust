@@ -171,6 +171,14 @@ pub(crate) struct CreateTempDir {
 }
 
 #[derive(Diagnostic)]
+#[diag("failed to {$action} compiler artifact `{$path}`: {$error}")]
+pub(crate) struct CompressedArtifactError {
+    pub action: &'static str,
+    pub path: PathBuf,
+    pub error: Error,
+}
+
+#[derive(Diagnostic)]
 #[diag("failed to add native library {$library_path}: {$error}")]
 pub(crate) struct AddNativeLibrary {
     pub library_path: PathBuf,

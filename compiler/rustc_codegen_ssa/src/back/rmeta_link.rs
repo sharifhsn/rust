@@ -2,7 +2,6 @@
 //! and potentially other data collected and used when building or linking a rlib.
 //! See <https://github.com/rust-lang/rust/issues/138243>.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use object::read::archive::ArchiveFile;
@@ -64,6 +63,11 @@ pub fn read(archive: &ArchiveFile<'_>, archive_data: &[u8], rlib_path: &Path) ->
 ///
 /// Use this when the caller's `ArchiveFile` comes from a different version of the `object` crate.
 pub fn read_from_data(archive_data: &[u8], rlib_path: &Path) -> Option<RmetaLink> {
+    if archive_data.starts_with(rustc_data_structures::compact_artifact::library::MAGIC) {
+        let library =
+            rustc_data_structures::compact_artifact::library::Library::parse(archive_data).ok()?;
+        return RmetaLink::decode(&library.link_metadata);
+    }
     let archive = ArchiveFile::parse(archive_data).ok()?;
     read(&archive, archive_data, rlib_path)
 }
@@ -106,11 +110,7 @@ fn crate_may_have_bundled_libs(libs: &[NativeLib]) -> bool {
 
 // FIXME: this is mostly a copy-paste of `DefaultMetadataLoader::get_rlib_metadata`.
 fn read_from_path(target: &Target, path: &Path) -> Option<RmetaLink> {
-    let Ok(file) = File::open(path) else {
-        debug!("failed to open rlib for rmeta-link: {}", path.display());
-        return None;
-    };
-    let Ok(mmap) = (unsafe { Mmap::map(file) }) else {
+    let Ok(mmap) = (unsafe { Mmap::map_artifact(path) }) else {
         debug!("failed to mmap rlib for rmeta-link: {}", path.display());
         return None;
     };

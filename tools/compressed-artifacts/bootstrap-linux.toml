@@ -1,0 +1,32 @@
+change-id = "ignore"
+
+[build]
+build = "aarch64-unknown-linux-gnu"
+host = ["aarch64-unknown-linux-gnu"]
+target = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+build-dir = "/tmp/rust-compact-bootstrap"
+jobs = 4
+docs = false
+extended = false
+
+[llvm]
+download-ci-llvm = true
+assertions = false
+
+[rust]
+download-rustc = false
+channel = "dev"
+optimize = true
+debug-assertions = false
+debuginfo-level = 0
+incremental = false
+codegen-units = 16
+lld = false
+
+# x86-64 std for cross builds (Debian: gcc-x86-64-linux-gnu, g++-x86-64-linux-gnu,
+# libc6-dev-amd64-cross; running the results needs libc6:amd64 under emulation).
+[target.x86_64-unknown-linux-gnu]
+cc = "x86_64-linux-gnu-gcc"
+cxx = "x86_64-linux-gnu-g++"
+ar = "x86_64-linux-gnu-ar"
+linker = "x86_64-linux-gnu-gcc"
