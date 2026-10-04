@@ -112,9 +112,13 @@ fn load_dep_graph(sess: &Session) -> LoadResult {
                 return LoadResult::DataOutOfDate;
             }
 
-            let prev_graph = SerializedDepGraph::decode(&mut decoder, &sess.prof);
-
-            LoadResult::Ok { prev_graph, prev_work_products }
+            match SerializedDepGraph::decode(&mut decoder, &sess.prof, path.parent().unwrap()) {
+                Ok(prev_graph) => LoadResult::Ok { prev_graph, prev_work_products },
+                Err(()) => {
+                    sess.dcx().emit_warn(diagnostics::CorruptFile { path: &path });
+                    LoadResult::DataOutOfDate
+                }
+            }
         }
     }
 }
@@ -192,7 +196,9 @@ pub fn setup_dep_graph(
     let load_result = load_dep_graph(sess);
 
     sess.time("incr_comp_garbage_collect_session_directories", || {
-        if let Err(e) = garbage_collect_session_directories(sess, &sess.incr_comp_session_dir()) {
+        if let Err(e) =
+            garbage_collect_session_directories(sess, &sess.incr_comp_session_dir(), true)
+        {
             warn!(
                 "Error while trying to garbage collect incremental compilation \
                 cache directory: {e}",

@@ -163,6 +163,43 @@ pub trait ArchiveBuilderBuilder {
             )
             .map_err(|e| ExtractBundledLibsError::MmapFile { rlib, error: Box::new(e) })?
         };
+        if archive_map.starts_with(rustc_data_structures::compact_artifact::library::MAGIC) {
+            use object::{Object, ObjectSection};
+            use rustc_data_structures::compact_artifact::CompactObject;
+            use rustc_data_structures::compact_artifact::library::Library;
+            let library = Library::parse(&archive_map)
+                .map_err(|e| ExtractBundledLibsError::ParseArchive { rlib, error: Box::new(e) })?;
+            let paths = library
+                .member_paths(rlib)
+                .map_err(|e| ExtractBundledLibsError::OpenFile { rlib, error: Box::new(e) })?;
+            for (member, path) in library.members.iter().zip(paths) {
+                if member.kind != 2
+                    || !bundled_lib_file_names.contains(&Symbol::intern(&member.name))
+                {
+                    continue;
+                }
+                let bytes = fs::read(&path)
+                    .map_err(|e| ExtractBundledLibsError::OpenFile { rlib, error: Box::new(e) })?;
+                let packed = CompactObject::parse(&bytes).map_err(|e| {
+                    ExtractBundledLibsError::ParseArchive { rlib, error: Box::new(e) }
+                })?;
+                let elf = object::File::parse(packed.metadata()).map_err(|e| {
+                    ExtractBundledLibsError::ParseArchive { rlib, error: Box::new(e) }
+                })?;
+                let section = elf.section_by_name(".bundled_lib").ok_or_else(|| {
+                    ExtractBundledLibsError::ExtractSection {
+                        rlib,
+                        error: "missing bundled library".into(),
+                    }
+                })?;
+                let data = packed.read_section(&bytes, section.index().0).map_err(|e| {
+                    ExtractBundledLibsError::ArchiveMember { rlib, error: Box::new(e) }
+                })?;
+                fs::write(outdir.join(&member.name), data)
+                    .map_err(|e| ExtractBundledLibsError::WriteFile { rlib, error: Box::new(e) })?;
+            }
+            return Ok(());
+        }
         let archive = ArchiveFile::parse(&*archive_map)
             .map_err(|e| ExtractBundledLibsError::ParseArchive { rlib, error: Box::new(e) })?;
 
@@ -327,6 +364,155 @@ pub trait ArchiveBuilder {
     fn add_archive(&mut self, archive: &Path, kind: AddArchiveKind<'_>) -> io::Result<()>;
 
     fn build(self: Box<Self>, output: &Path, symbols: Option<ArchiveSymbols>) -> bool;
+}
+
+/// Experimental library producer: an ordered manifest and shared compact objects.
+/// The local path dependency is shared with Wild so there is one format implementation.
+pub(crate) struct CompactArchiveBuilder<'a> {
+    sess: &'a Session,
+    metadata: PathBuf,
+    files: Vec<(PathBuf, u32)>,
+    native: Vec<(String, Vec<u8>)>,
+    link_metadata: Vec<u8>,
+}
+
+impl<'a> CompactArchiveBuilder<'a> {
+    pub(crate) fn new(sess: &'a Session, metadata: &EncodedMetadata) -> Self {
+        let unsupported =
+            if sess.target.os != rustc_target::spec::Os::Linux || sess.target.pointer_width != 64 {
+                Some("compact artifacts currently require 64-bit Linux ELF")
+            } else if sess.opts.cg.linker_plugin_lto.enabled()
+                || !matches!(
+                    sess.lto(),
+                    rustc_session::config::Lto::No | rustc_session::config::Lto::ThinLocal
+                )
+            {
+                Some("compact artifacts currently require cross-crate LTO to be disabled")
+            } else if sess.split_debuginfo() == rustc_target::spec::SplitDebuginfo::Packed {
+                // Packing reads `.dwo` members out of dependency rlibs, which compact libraries
+                // do not carry (see `add_file`).
+                Some("compact artifacts do not support `-Csplit-debuginfo=packed`")
+            } else {
+                None
+            };
+        if let Some(message) = unsupported {
+            sess.dcx().emit_fatal(crate::diagnostics::CompressedArtifactError {
+                action: "validate compact library",
+                path: metadata.path().unwrap().to_owned(),
+                error: io::Error::other(message),
+            });
+        }
+        Self {
+            sess,
+            metadata: metadata.path().expect("rlib metadata path").to_path_buf(),
+            files: Vec::new(),
+            native: Vec::new(),
+            link_metadata: Vec::new(),
+        }
+    }
+}
+
+impl ArchiveBuilder for CompactArchiveBuilder<'_> {
+    fn add_file(&mut self, path: &Path, kind: ArchiveEntryKind) {
+        if path.file_name().is_some_and(|n| n == "lib.rmeta") {
+            return;
+        }
+        if path.file_name().is_some_and(|n| n == rmeta_link::FILENAME) {
+            let bytes = fs::read(path).expect("read generated link metadata");
+            self.link_metadata = search_for_section(path, &bytes, rmeta_link::SECTION)
+                .expect("generated link metadata section")
+                .to_vec();
+            return;
+        }
+        // With unpacked split DWARF, debuggers read each `.dwo` from the path recorded in its
+        // skeleton unit, next to the object in the output directory. A member copy would only
+        // store the same DWARF a second time.
+        if path.extension().is_some_and(|extension| extension == "dwo") {
+            return;
+        }
+        self.files.push((path.to_owned(), if kind == ArchiveEntryKind::RustObj { 0 } else { 1 }));
+    }
+
+    fn add_archive(&mut self, path: &Path, _kind: AddArchiveKind<'_>) -> io::Result<()> {
+        let bytes = fs::read(path)?;
+        let archive = ArchiveFile::parse(bytes.as_slice()).map_err(io::Error::other)?;
+        if archive.is_thin() {
+            return Err(io::Error::other(
+                "thin native archives are not implemented for compact artifacts",
+            ));
+        }
+        for member in archive.members() {
+            let member = member.map_err(io::Error::other)?;
+            self.native.push((
+                String::from_utf8(member.name().to_vec()).map_err(io::Error::other)?,
+                member.data(bytes.as_slice()).map_err(io::Error::other)?.to_vec(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn build(self: Box<Self>, output: &Path, symbols: Option<ArchiveSymbols>) -> bool {
+        use rustc_data_structures::compact_artifact::library::{Library, Member};
+        use rustc_data_structures::compact_artifact::{self as compact};
+        let sess = self.sess;
+        let result = (|| -> io::Result<bool> {
+            if symbols.is_some() {
+                return Err(io::Error::other("compact symbol rewriting is not implemented"));
+            }
+            let parent = output.parent().unwrap_or(Path::new("."));
+            fs::create_dir_all(parent)?;
+            let metadata_path = output.with_extension("rmeta");
+            if fs::canonicalize(&self.metadata)?
+                != fs::canonicalize(&metadata_path).unwrap_or_default()
+            {
+                compact::atomic_write(&metadata_path, &fs::read(&self.metadata)?)?;
+            }
+            let store = self.sess.opts.unstable_opts.compact_artifact_store.as_ref().unwrap();
+            let profile = self.sess.opts.unstable_opts.artifact_compression_options();
+            let options = compact::Options { level: profile.level, block_size: profile.chunk_size };
+            fs::create_dir_all(store)?;
+            // References are relative, so moving the target keeps them valid. Readers
+            // also resolve Cargo's hard-linked aliases, such as `target/<profile>/`.
+            let mut library = Library {
+                metadata: compact::relative_path(&metadata_path, parent)?,
+                link_metadata: self.link_metadata,
+                store: compact::relative_path(store, parent)?,
+                members: Vec::new(),
+            };
+            for (path, kind) in &self.files {
+                let bytes = fs::read(path)?;
+                let kind = if *kind == 1 && search_for_section(path, &bytes, ".bundled_lib").is_ok()
+                {
+                    2
+                } else {
+                    *kind
+                };
+                let object = compact::store_object(&bytes, store, options)?;
+                library.members.push(Member {
+                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path: compact::store_file_name(&object)?,
+                    kind,
+                });
+            }
+            for (name, bytes) in self.native {
+                let object = compact::store_object(&bytes, store, options)?;
+                library.members.push(Member {
+                    name,
+                    path: compact::store_file_name(&object)?,
+                    kind: 1,
+                });
+            }
+            library.write(output)?;
+            Ok(!library.members.is_empty())
+        })();
+        result.unwrap_or_else(|error| {
+            sess.dcx().emit_fatal(crate::diagnostics::CompressedArtifactError {
+                action: "write compact library",
+                path: output.to_owned(),
+                error,
+            })
+        })
+    }
 }
 
 fn target_archive_format_to_object_kind(format: &str) -> Option<ObjectArchiveKind> {

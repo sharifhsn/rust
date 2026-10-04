@@ -178,12 +178,16 @@ impl DepGraph {
         prev_work_products: WorkProductMap,
         encoder: FileEncoder<'static>,
     ) -> DepGraph {
-        let prev_graph_node_count = prev_graph.node_count();
+        let prev_graph_index_space_len = prev_graph.index_space_len();
 
-        let current =
-            CurrentDepGraph::new(session, prev_graph_node_count, encoder, Arc::clone(&prev_graph));
+        let current = CurrentDepGraph::new(
+            session,
+            prev_graph_index_space_len,
+            encoder,
+            Arc::clone(&prev_graph),
+        );
 
-        let colors = DepNodeColorMap::new(prev_graph_node_count);
+        let colors = DepNodeColorMap::new(prev_graph_index_space_len);
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
         let _green_node_index = current.alloc_new_node(
@@ -202,7 +206,7 @@ impl DepGraph {
             Fingerprint::ZERO,
         );
         assert_eq!(red_node_index, DepNodeIndex::FOREVER_RED_NODE);
-        if prev_graph_node_count > 0 {
+        if prev_graph_index_space_len > 0 {
             let prev_index =
                 const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
             let result = colors.try_set_color(prev_index, DesiredColor::Red);
@@ -702,12 +706,16 @@ impl DepGraphData {
 
     #[inline]
     pub fn prev_value_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> Fingerprint {
-        self.previous.value_fingerprint_for_index(prev_index)
+        self.previous
+            .value_fingerprint_for_index(prev_index)
+            .expect("a colored previous dep node must have a readable page")
     }
 
     #[inline]
-    pub(crate) fn prev_node_of(&self, prev_index: SerializedDepNodeIndex) -> &DepNode {
-        self.previous.index_to_node(prev_index)
+    pub(crate) fn prev_node_of(&self, prev_index: SerializedDepNodeIndex) -> DepNode {
+        self.previous
+            .index_to_node(prev_index)
+            .expect("a colored previous dep node must have a readable page")
     }
 
     pub fn mark_debug_loaded_from_disk(&self, dep_node: DepNode) {
@@ -788,7 +796,8 @@ impl DepGraphData {
         if let Some(prev_index) = self.previous.node_to_index_opt(&key) {
             // Determine the color and index of the new `DepNode`.
             let is_green = if let Some(value_fingerprint) = value_fingerprint {
-                if value_fingerprint == self.previous.value_fingerprint_for_index(prev_index) {
+                if self.previous.value_fingerprint_for_index(prev_index) == Some(value_fingerprint)
+                {
                     // This is a green node: it existed in the previous compilation,
                     // its query was re-executed, and it has the same result as before.
                     true
@@ -836,8 +845,12 @@ impl DepGraphData {
         if let Some(dep_node_index) = dep_node_index {
             self.current.record_edge(
                 dep_node_index,
-                *self.previous.index_to_node(prev_index),
-                self.previous.value_fingerprint_for_index(prev_index),
+                self.previous
+                    .index_to_node(prev_index)
+                    .expect("a promoted previous dep node must have a readable page"),
+                self.previous
+                    .value_fingerprint_for_index(prev_index)
+                    .expect("a promoted previous dep node must have a readable page"),
             );
         }
 
@@ -907,7 +920,9 @@ impl DepGraphData {
         // Return None if the dep node didn't exist in the previous session
         let prev_index = self.previous.node_to_index_opt(dep_node)?;
 
-        debug_assert_eq!(self.previous.index_to_node(prev_index), dep_node);
+        if self.previous.index_to_node(prev_index)? != *dep_node {
+            return None;
+        }
 
         match self.colors.get(prev_index) {
             DepNodeColor::Green(dep_node_index) => Some((prev_index, dep_node_index)),
@@ -942,10 +957,13 @@ impl DepGraphData {
         let mut edges = EdgeFrame::new(edge_buf);
         let frame = MarkFrame { index: prev_dep_node_index, parent: frame };
 
-        // We never try to mark eval_always nodes as green
-        debug_assert!(!tcx.is_eval_always(self.previous.index_to_node(prev_dep_node_index).kind));
+        // A damaged page is treated as a red node. A missing dependency can never be
+        // interpreted as an empty edge list, which would incorrectly preserve green queries.
+        let dep_node = self.previous.index_to_node(prev_dep_node_index)?;
+        debug_assert!(!tcx.is_eval_always(dep_node.kind));
+        let previous_edges = self.previous.edge_targets_from(prev_dep_node_index)?;
 
-        for parent_dep_node_index in self.previous.edge_targets_from(prev_dep_node_index) {
+        for parent_dep_node_index in previous_edges {
             match self.colors.get(parent_dep_node_index) {
                 // This dependency has been marked as green before, we are still ok and can
                 // continue checking the remaining dependencies.
@@ -962,7 +980,9 @@ impl DepGraphData {
                 DepNodeColor::Unknown => {}
             }
 
-            let parent_dep_node = self.previous.index_to_node(parent_dep_node_index);
+            let Some(parent_dep_node) = self.previous.index_to_node(parent_dep_node_index) else {
+                return None;
+            };
 
             // If this dependency isn't eval_always, try to mark it green recursively.
             if !tcx.is_eval_always(parent_dep_node.kind)
@@ -980,7 +1000,7 @@ impl DepGraphData {
             }
 
             // We failed to mark it green, so we try to force the query.
-            if !tcx.try_force_from_dep_node(*parent_dep_node, parent_dep_node_index, &frame) {
+            if !tcx.try_force_from_dep_node(parent_dep_node, parent_dep_node_index, &frame) {
                 return None;
             }
 
@@ -1065,11 +1085,13 @@ impl DepGraph {
         for prev_index in data.colors.values.indices() {
             match data.colors.get(prev_index) {
                 DepNodeColor::Green(dep_node_index) => {
-                    let dep_node = data.previous.index_to_node(prev_index);
+                    let Some(dep_node) = data.previous.index_to_node(prev_index) else {
+                        continue;
+                    };
                     if let Some(promote_fn) =
                         tcx.dep_kind_vtable(dep_node.kind).promote_from_disk_fn
                     {
-                        promote_fn(tcx, *dep_node, prev_index, dep_node_index)
+                        promote_fn(tcx, dep_node, prev_index, dep_node_index)
                     };
                 }
                 DepNodeColor::Unknown | DepNodeColor::Red => {
@@ -1081,8 +1103,20 @@ impl DepGraph {
         }
     }
 
-    pub(crate) fn finish_encoding(&self) -> FileEncodeResult {
+    pub fn finish_encoding(&self) -> FileEncodeResult {
         if let Some(data) = &self.data { data.current.encoder.finish(&data.current) } else { Ok(0) }
+    }
+
+    /// Converts a current-session index to the stable index written into the
+    /// paged dependency graph. The query-cache footer uses the same index space
+    /// as the graph so it can be loaded without a separate relocation table.
+    pub fn serialized_index_for_cache(&self, index: DepNodeIndex) -> SerializedDepNodeIndex {
+        self.data
+            .as_ref()
+            .expect("the incremental query cache requires an enabled dependency graph")
+            .current
+            .encoder
+            .serialized_index_for_cache(index)
     }
 
     pub fn next_virtual_depnode_index(&self) -> DepNodeIndex {
@@ -1412,7 +1446,10 @@ pub(crate) fn print_markframe_trace(graph: &DepGraph, frame: &MarkFrame<'_>) {
     let mut i = 0;
     let mut current = Some(frame);
     while let Some(frame) = current {
-        let node = data.previous.index_to_node(frame.index);
+        let node = data.previous.index_to_node(frame.index).unwrap_or_else(|| DepNode {
+            kind: DepKind::Null,
+            key_fingerprint: PackedFingerprint::from(Fingerprint::ZERO),
+        });
         eprintln!("#{i} {node:?}");
         current = frame.parent;
         i += 1;
@@ -1433,7 +1470,7 @@ fn panic_on_forbidden_read(data: &DepGraphData, dep_node_index: DepNodeIndex) ->
     // previous session and has been marked green
     for prev_index in data.colors.values.indices() {
         if data.colors.current(prev_index) == Some(dep_node_index) {
-            dep_node = Some(*data.previous.index_to_node(prev_index));
+            dep_node = data.previous.index_to_node(prev_index);
             break;
         }
     }

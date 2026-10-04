@@ -7,6 +7,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::ops::{ControlFlow, Deref};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::{env, fmt, fs, io, mem, str};
 
 use find_msvc_tools;
@@ -15,6 +16,7 @@ use object::{Object, ObjectSection, ObjectSymbol};
 use regex::Regex;
 use rustc_arena::TypedArena;
 use rustc_attr_parsing::eval_config_entry;
+use rustc_data_structures::artifact_compression;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::temp_dir::MaybeTempDir;
@@ -141,7 +143,7 @@ pub fn link_binary(
     sess: &Session,
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     compiled_modules: CompiledModules,
-    crate_info: CrateInfo,
+    mut crate_info: CrateInfo,
     metadata: EncodedMetadata,
     outputs: &OutputFilenames,
     codegen_backend: &'static str,
@@ -150,6 +152,16 @@ pub fn link_binary(
     let output_metadata = sess.opts.output_types.contains_key(&OutputType::Metadata);
     let mut tempfiles_for_stdout_output: Vec<PathBuf> = Vec::new();
     let mut rmeta_link_cache = RmetaLinkCache::default();
+
+    // Keep conventional inputs only for this link operation. Archive member
+    // selection still belongs to the ordinary linker; compression must not turn
+    // an archive into a list of eagerly linked objects. Library-only rustc jobs
+    // do not need to expand their upstream archives.
+    let _compressed_inputs = if outputs.outputs.should_link() {
+        materialize_compressed_rlibs(sess, &mut crate_info, outputs)
+    } else {
+        None
+    };
 
     if outputs.outputs.should_link() {
         sess.time("check_externally_implementable_item_linkage", || {
@@ -208,6 +220,22 @@ pub fn link_binary(
                         &path,
                     )
                     .build(&out_filename, None);
+                    if sess.opts.unstable_opts.compress_artifacts
+                        && sess.opts.unstable_opts.compact_artifact_store.is_none()
+                    {
+                        if let Err(error) = sess.time("compress_rlib", || {
+                            artifact_compression::pack_with_options(
+                                &out_filename,
+                                sess.opts.unstable_opts.artifact_compression_options(),
+                            )
+                        }) {
+                            sess.dcx().emit_fatal(diagnostics::CompressedArtifactError {
+                                action: "compress",
+                                path: out_filename.clone(),
+                                error,
+                            });
+                        }
+                    }
                 }
                 CrateType::StaticLib => {
                     link_staticlib(
@@ -327,6 +355,69 @@ pub fn link_binary(
     });
 }
 
+/// Adapt compressed Rust archives for existing system linkers. The returned
+/// owner keeps temporary files alive until linking finishes and removes them
+/// on normal exit/unwind, unless the user explicitly requests saved temps.
+fn materialize_compressed_rlibs(
+    sess: &Session,
+    crate_info: &mut CrateInfo,
+    outputs: &OutputFilenames,
+) -> Option<MaybeTempDir> {
+    let crate_type = crate_info.crate_types.iter().copied().find(|t| *t != CrateType::Rlib)?;
+    let output = out_filename(sess, crate_type, outputs, crate_info.local_crate_name);
+    let mut directory: Option<MaybeTempDir> = None;
+    for cnum in crate_info.used_crates.clone() {
+        let needs_archive = crate_info.crate_types.iter().any(|crate_type| {
+            *crate_type != CrateType::Rlib
+                && crate_info
+                    .dependency_formats
+                    .get(crate_type)
+                    .and_then(|formats| formats.get(cnum))
+                    == Some(&Linkage::Static)
+        });
+        if !needs_archive {
+            continue;
+        }
+        let Some(source) = crate_info.used_crate_source[&cnum].rlib.clone() else {
+            continue;
+        };
+        let compressed = artifact_compression::is_compressed(&source).unwrap_or_else(|error| {
+            sess.dcx().emit_fatal(diagnostics::CompressedArtifactError {
+                action: "inspect",
+                path: source.clone(),
+                error,
+            });
+        });
+        if !compressed {
+            continue;
+        }
+        let dir = directory.get_or_insert_with(|| {
+            let dir = TempDirBuilder::new()
+                .prefix("rustc-artifacts")
+                .tempdir_in(output.parent().unwrap_or_else(|| Path::new(".")))
+                .unwrap_or_else(|error| {
+                    sess.dcx().emit_fatal(diagnostics::CreateTempDir { error })
+                });
+            MaybeTempDir::new(dir, sess.opts.cg.save_temps)
+        });
+        // Separate directories retain the exact archive basename, even when
+        // inputs from different directories happen to have the same name.
+        let parent = dir.as_ref().join(cnum.as_u32().to_string());
+        let dest = parent.join(source.file_name().unwrap());
+        fs::create_dir(&parent)
+            .and_then(|()| artifact_compression::unpack_to(&source, &dest))
+            .unwrap_or_else(|error| {
+                sess.dcx().emit_fatal(diagnostics::CompressedArtifactError {
+                    action: "materialize",
+                    path: source.clone(),
+                    error,
+                });
+            });
+        Arc::make_mut(crate_info.used_crate_source.get_mut(&cnum).unwrap()).rlib = Some(dest);
+    }
+    directory
+}
+
 // Crate type is not passed when calculating the dylibs to include for LTO. In that case all
 // crate types must use the same dependency formats.
 pub fn each_linked_rlib(
@@ -410,7 +501,14 @@ fn link_rlib<'a>(
     flavor: RlibFlavor,
     tmpdir: &MaybeTempDir,
 ) -> Box<dyn ArchiveBuilder + 'a> {
-    let mut ab = archive_builder_builder.new_archive_builder(sess);
+    let mut ab: Box<dyn ArchiveBuilder> =
+        if sess.opts.unstable_opts.compact_artifact_store.is_some()
+            && matches!(flavor, RlibFlavor::Normal)
+        {
+            Box::new(super::archive::CompactArchiveBuilder::new(sess, metadata))
+        } else {
+            archive_builder_builder.new_archive_builder(sess)
+        };
 
     // Pre-compute the list of Rust object filenames and materialize the rmeta-link
     // wrapper file before any `add_file` calls. This lets the rmeta-link member be

@@ -50,27 +50,53 @@ mod cstore_impl;
 /// A reference to the raw binary version of crate metadata.
 /// This struct applies [`MemDecoder`]'s validation when constructed
 /// so that later constructions are guaranteed to succeed.
-pub(crate) struct MetadataBlob(OwnedSlice);
-
-impl std::ops::Deref for MetadataBlob {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        &self.0[..]
-    }
+pub(crate) struct MetadataBlob {
+    bytes: OwnedSlice,
+    indexed: Option<std::sync::Arc<rustc_data_structures::indexed_artifact::IndexedArtifact>>,
 }
 
 impl MetadataBlob {
     /// Runs the [`MemDecoder`] validation and if it passes, constructs a new [`MetadataBlob`].
     pub(crate) fn new(slice: OwnedSlice) -> Result<Self, ()> {
-        if MemDecoder::new(&slice, 0).is_ok() { Ok(Self(slice)) } else { Err(()) }
+        let indexed =
+            rustc_data_structures::indexed_artifact::IndexedArtifact::from_slice(slice.clone())
+                .map_err(|_| ())?
+                .map(std::sync::Arc::new);
+        let result = Self { bytes: slice, indexed };
+        result.mem_decoder(0)?;
+        Ok(result)
     }
 
     /// Since this has passed the validation of [`MetadataBlob::new`], this returns bytes which are
     /// known to pass the [`MemDecoder`] validation.
-    pub(crate) fn bytes(&self) -> &OwnedSlice {
-        &self.0
+    fn mem_decoder(&self, pos: usize) -> Result<MemDecoder<'_>, ()> {
+        match &self.indexed {
+            Some(source) => MemDecoder::from_source(&**source, pos),
+            None => MemDecoder::new(&self.bytes, pos),
+        }
+    }
+
+    pub(crate) fn range(&self, start: usize, end: usize) -> &[u8] {
+        match &self.indexed {
+            Some(source) => source.range(start, end - start),
+            None => &self.bytes[start..end],
+        }
+    }
+
+    pub(crate) fn owned_range(&self, start: usize, end: usize) -> OwnedSlice {
+        match &self.indexed {
+            Some(source) => {
+                rustc_data_structures::owned_slice::slice_owned(source.clone(), |source| {
+                    source.range(start, end - start)
+                })
+            }
+            None => self.bytes.clone().slice(|bytes| &bytes[start..end]),
+        }
+    }
+
+    fn starts_with(&self, prefix: &[u8]) -> bool {
+        let len = self.mem_decoder(0).unwrap().len();
+        len >= prefix.len() && self.range(0, prefix.len()) == prefix
     }
 }
 
@@ -285,7 +311,7 @@ impl<'a> MetaDecoder for &'a MetadataBlob {
             // self-referential struct which is downright goofy because `MetadataBlob` is already
             // self-referential. Probably `MemDecoder` should contain an `OwnedSlice`, but that
             // demands a significant refactoring due to our crate graph.
-            opaque: MemDecoder::new(self, pos).unwrap(),
+            opaque: self.mem_decoder(pos).unwrap(),
             lazy_state: LazyState::NoNode,
             blob: self.blob(),
         }
@@ -727,7 +753,7 @@ impl MetadataBlob {
 
     fn root_pos(&self) -> NonZero<usize> {
         let offset = METADATA_HEADER.len();
-        let pos_bytes = self[offset..][..8].try_into().unwrap();
+        let pos_bytes = self.range(offset, offset + 8).try_into().unwrap();
         let pos = u64::from_le_bytes(pos_bytes);
         NonZero::new(pos as usize).unwrap()
     }

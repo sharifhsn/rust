@@ -2361,7 +2361,7 @@ fn prefetch_mir(tcx: TyCtxt<'_>) {
 pub struct EncodedMetadata {
     // The declaration order matters because `full_metadata` should be dropped
     // before `_temp_dir`.
-    full_metadata: Option<Mmap>,
+    full_metadata: std::sync::OnceLock<Option<Mmap>>,
     // This is an optional stub metadata containing only the crate header.
     // The header should be very small, so we load it directly into memory.
     stub_metadata: Option<Vec<u8>>,
@@ -2379,17 +2379,23 @@ impl EncodedMetadata {
         stub_path: Option<PathBuf>,
         temp_dir: Option<MaybeTempDir>,
     ) -> std::io::Result<Self> {
-        let file = std::fs::File::open(&path)?;
-        let file_metadata = file.metadata()?;
+        let file_metadata = std::fs::metadata(&path)?;
         if file_metadata.len() == 0 {
             return Ok(Self {
-                full_metadata: None,
+                full_metadata: std::sync::OnceLock::from(None),
                 stub_metadata: None,
                 path: None,
                 _temp_dir: None,
             });
         }
-        let full_mmap = unsafe { Some(Mmap::map(file)?) };
+        // Keep ordinary files file-backed. The experimental compressed format is
+        // eagerly decoded into an owned contiguous buffer so metadata decoders can retain
+        // their existing slice contract.
+        let full_mmap = if stub_path.is_some() {
+            std::sync::OnceLock::new()
+        } else {
+            std::sync::OnceLock::from(unsafe { Some(Mmap::map_artifact(&path)?) })
+        };
 
         let stub =
             if let Some(stub_path) = stub_path { Some(std::fs::read(stub_path)?) } else { None };
@@ -2404,12 +2410,19 @@ impl EncodedMetadata {
 
     #[inline]
     pub fn full(&self) -> &[u8] {
-        &self.full_metadata.as_deref().unwrap_or_default()
+        self.full_metadata
+            .get_or_init(|| {
+                self.path.as_ref().map(|path| {
+                    unsafe { Mmap::map_artifact(path) }.expect("read own encoded metadata")
+                })
+            })
+            .as_deref()
+            .unwrap_or_default()
     }
 
     #[inline]
     pub fn stub_or_full(&self) -> &[u8] {
-        self.stub_metadata.as_deref().unwrap_or(self.full())
+        self.stub_metadata.as_deref().unwrap_or_else(|| self.full())
     }
 
     #[inline]
@@ -2440,7 +2453,12 @@ impl<D: Decoder> Decodable<D> for EncodedMetadata {
             None
         };
 
-        Self { full_metadata, stub_metadata: stub, path: None, _temp_dir: None }
+        Self {
+            full_metadata: std::sync::OnceLock::from(full_metadata),
+            stub_metadata: stub,
+            path: None,
+            _temp_dir: None,
+        }
     }
 }
 
@@ -2480,7 +2498,27 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
         let incr_comp_session_dir = tcx.sess.incr_comp_session_dir();
         let source_file_in_incr_dir = &incr_comp_session_dir.join(saved_path);
         debug!("copying preexisting metadata from {source_file_in_incr_dir:?} to {path:?}");
-        match rustc_fs_util::link_or_copy(&source_file_in_incr_dir, path) {
+        // The cache may be packed independently of the emitted metadata format. When artifact
+        // compression is disabled, restore ordinary metadata rather than publishing the packed
+        // cache file through a hard link.
+        let restore = if !tcx.sess.opts.unstable_opts.compress_artifacts
+            && tcx.sess.opts.unstable_opts.compact_artifact_store.is_none()
+        {
+            rustc_data_structures::artifact_compression::is_compressed(source_file_in_incr_dir)
+                .and_then(|packed| {
+                    if packed {
+                        rustc_data_structures::artifact_compression::unpack_to(
+                            source_file_in_incr_dir,
+                            path,
+                        )
+                    } else {
+                        rustc_fs_util::link_or_copy(source_file_in_incr_dir, path).map(|_| ())
+                    }
+                })
+        } else {
+            rustc_fs_util::link_or_copy(source_file_in_incr_dir, path).map(|_| ())
+        };
+        match restore {
             Ok(_) => {}
             Err(err) => tcx.dcx().emit_fatal(FailCreateFileEncoder { err }),
         };

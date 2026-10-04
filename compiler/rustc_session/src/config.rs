@@ -3188,6 +3188,7 @@ pub(crate) mod dep_tracking {
 
     impl_dep_tracking_hash_via_hash!(
         (),
+        i32,
         AnnotateMoves,
         AutoDiff,
         Offload,

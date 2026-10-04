@@ -12,6 +12,7 @@ use rustc_session::Session;
 use tracing::debug;
 
 use crate::diagnostics;
+use crate::persist::file_format;
 use crate::persist::fs::*;
 
 /// Copies a CGU work product to the incremental compilation directory, so next compilation can
@@ -35,8 +36,45 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
             let _ = saved_files.insert(ext.to_string(), file_name);
             continue;
         }
+        if *ext == "o"
+            && let Some(store) = &sess.opts.unstable_opts.compact_artifact_store
+        {
+            use rustc_data_structures::compact_artifact as compact;
+            let result = (|| -> std::io::Result<()> {
+                let profile = sess.opts.unstable_opts.artifact_compression_options();
+                let object = compact::store_object(
+                    &std_fs::read(path)?,
+                    store,
+                    compact::Options { level: profile.level, block_size: profile.chunk_size },
+                )?;
+                compact::link_object(&object, path)?;
+                compact::link_object(&object, &path_in_incr_dir)
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = saved_files.insert(ext.to_string(), file_name);
+                }
+                Err(err) => {
+                    sess.dcx().emit_warn(diagnostics::CopyWorkProductToCache {
+                        from: path,
+                        to: &path_in_incr_dir,
+                        err,
+                    });
+                }
+            }
+            continue;
+        }
         match link_or_copy(path, &path_in_incr_dir) {
             Ok(_) => {
+                // A `.dwo` stays hard-linked to the copy debuggers read from the output
+                // directory; packing it would store its DWARF twice.
+                if *ext != "dwo" {
+                    file_format::compress_incremental_artifact(
+                        sess,
+                        &path_in_incr_dir,
+                        "compress_incremental_work_product",
+                    );
+                }
                 let _ = saved_files.insert(ext.to_string(), file_name);
             }
             Err(err) => {

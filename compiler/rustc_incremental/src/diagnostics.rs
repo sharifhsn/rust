@@ -130,6 +130,13 @@ pub(crate) struct WriteNew<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag("could not compress incremental cache file `{$path}`; keeping it uncompressed: {$err}")]
+pub(crate) struct CompressIncrementalArtifact<'a> {
+    pub path: &'a Path,
+    pub err: std::io::Error,
+}
+
+#[derive(Diagnostic)]
 #[diag("incremental compilation: error canonicalizing path `{$path}`: {$err}")]
 pub(crate) struct CanonicalizePath {
     pub path: PathBuf,

@@ -14,6 +14,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::{array, env, fs};
 
+use rustc_data_structures::artifact_compression::{self, PackStats};
 use rustc_data_structures::memmap::Mmap;
 use rustc_serialize::Encoder;
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
@@ -26,7 +27,7 @@ use crate::diagnostics;
 const FILE_MAGIC: &[u8] = b"RSIC";
 
 /// Change this if the header format changes.
-const HEADER_FORMAT_VERSION: u16 = 0;
+const HEADER_FORMAT_VERSION: u16 = 1;
 
 pub(crate) fn write_file_header(stream: &mut FileEncoder<'_>, sess: &Session) {
     stream.emit_raw_bytes(FILE_MAGIC);
@@ -69,14 +70,42 @@ where
 
     match encode(encoder) {
         Ok(position) => {
+            let artifact_size =
+                compress_incremental_artifact(sess, &path_buf, "compress_incremental_records")
+                    .map_or(position as u64, |stats| stats.packed_bytes);
             sess.prof.artifact_size(
                 &name.replace(' ', "_"),
                 path_buf.file_name().unwrap().to_string_lossy(),
-                position as u64,
+                artifact_size,
             );
             debug!("save: data written to disk successfully");
         }
         Err((path, err)) => sess.dcx().emit_fatal(diagnostics::WriteNew { name, path, err }),
+    }
+}
+
+/// Packs a completed incremental-cache artifact when compression is enabled.
+/// Compression is an optional size optimization: a failure leaves the raw file usable.
+pub(crate) fn compress_incremental_artifact(
+    sess: &Session,
+    path: &Path,
+    activity: &'static str,
+) -> Option<PackStats> {
+    if !sess.opts.unstable_opts.compress_incremental {
+        return None;
+    }
+
+    match sess.time(activity, || {
+        artifact_compression::pack_with_options(
+            path,
+            sess.opts.unstable_opts.artifact_compression_options(),
+        )
+    }) {
+        Ok(stats) => Some(stats),
+        Err(err) => {
+            sess.dcx().emit_warn(diagnostics::CompressIncrementalArtifact { path, err });
+            None
+        }
     }
 }
 
@@ -113,21 +142,16 @@ pub(crate) fn open_incremental_file(
     sess: &Session,
     path: &Path,
 ) -> Result<OpenFile, OpenFileError> {
-    let file = fs::File::open(path).map_err(|err| {
+    // SAFETY: Raw files have the same immutable-backing-file contract as the direct mmap used
+    // here previously. The session lock protects against cooperating compiler processes, but
+    // cannot prevent an external process from changing a cache file. Packed data is decoded now.
+    let mmap = unsafe { Mmap::map_artifact(path) }.map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
             OpenFileError::NotFoundOrHeaderMismatch
         } else {
             OpenFileError::IoError { err }
         }
     })?;
-
-    // SAFETY: This process must not modify nor remove the backing file while the memory map lives.
-    // For the dep-graph and the work product index, it is as soon as the decoding is done.
-    // For the query result cache, the memory map is dropped in save_dep_graph before calling
-    // save_in and trying to remove the backing file.
-    //
-    // There is no way to prevent another process from modifying this file.
-    let mmap = unsafe { Mmap::map(file) }?;
 
     let mut file = io::Cursor::new(&*mmap);
 

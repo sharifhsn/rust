@@ -826,6 +826,11 @@ mod desc {
     pub(crate) const parse_opt_comma_list: &str = parse_comma_list;
     pub(crate) const parse_number: &str = "a number";
     pub(crate) const parse_opt_number: &str = parse_number;
+    pub(crate) const parse_artifact_compression_profile: &str =
+        "one of `fast`, `balanced`, `small`, or `legacy`";
+    pub(crate) const parse_artifact_compression_level: &str = "an integer between -5 and 19";
+    pub(crate) const parse_artifact_compression_chunk_size: &str =
+        "a power of two between 16384 and 4194304 bytes";
     pub(crate) const parse_frame_pointer: &str = "one of `true`/`yes`/`on`, `false`/`no`/`off`, or (with -Zunstable-options) `non-leaf` or `always`";
     pub(crate) const parse_threads: &str = "a number or `sync`";
     pub(crate) const parse_time_passes_format: &str = "`text` (default) or `json`";
@@ -959,6 +964,44 @@ pub mod parse {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn parse_artifact_compression_profile(slot: &mut String, v: Option<&str>) -> bool {
+        match v {
+            Some(value @ ("fast" | "balanced" | "small" | "legacy")) => {
+                *slot = value.to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn parse_artifact_compression_level(
+        slot: &mut Option<i32>,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(value) = v.and_then(|v| v.parse::<i32>().ok()) else {
+            return false;
+        };
+        if !(-5..=19).contains(&value) {
+            return false;
+        }
+        *slot = Some(value);
+        true
+    }
+
+    pub(crate) fn parse_artifact_compression_chunk_size(
+        slot: &mut Option<usize>,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(value) = v.and_then(|v| v.parse::<usize>().ok()) else {
+            return false;
+        };
+        if !(16384..=4194304).contains(&value) || !value.is_power_of_two() {
+            return false;
+        }
+        *slot = Some(value);
+        true
     }
 
     /// Use this for any boolean option that lacks a static default. (The
@@ -2353,6 +2396,12 @@ options! {
     annotate_moves: AnnotateMoves = (AnnotateMoves::Disabled, parse_annotate_moves, [TRACKED],
         "emit debug info for compiler-generated move and copy operations \
         to make them visible in profilers. Can be a boolean or a size limit in bytes (default: disabled)"),
+    artifact_compression_chunk_size: Option<usize> = (None, parse_artifact_compression_chunk_size, [TRACKED],
+        "override compressed artifact chunk size in bytes (16384..4194304, power of two)"),
+    artifact_compression_level: Option<i32> = (None, parse_artifact_compression_level, [TRACKED],
+        "override compressed artifact zstd level (-5..19)"),
+    artifact_compression_profile: String = ("balanced".to_owned(), parse_artifact_compression_profile, [TRACKED],
+        "compressed artifact tradeoff: fast, balanced (default), small, legacy"),
     assert_incr_state: Option<IncrementalStateAssertion> = (None, parse_assert_incr_state, [UNTRACKED],
         "assert that the incremental cache is in given state: \
          either `loaded` or `not-loaded`."),
@@ -2403,6 +2452,12 @@ options! {
         "emit retag function calls in generated code"),
     codegen_source_order: bool = (false, parse_bool, [UNTRACKED],
         "emit mono items in the order of spans in source files (default: no)"),
+    compact_artifact_store: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
+        "emit compact library manifests and shared objects for the experimental Wild reader"),
+    compress_artifacts: bool = (false, parse_bool, [TRACKED],
+        "store `.rmeta` files and `.rlib` archives in compressed format (default: no)"),
+    compress_incremental: bool = (false, parse_bool, [TRACKED],
+        "store incremental records and codegen work products in compressed format (default: no)"),
     contract_checks: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "emit runtime checks for contract pre- and post-conditions (default: no)"),
     coverage_options: CoverageOptions = (CoverageOptions::default(), parse_coverage_options, [TRACKED],
@@ -2975,4 +3030,22 @@ written to standard error output)"),
     // If you add a new option, please update:
     // - compiler/rustc_interface/src/tests.rs
     // - src/doc/unstable-book/src/compiler-flags
+}
+
+impl UnstableOptions {
+    /// Readers obtain chunk geometry from the file; matching flags are unnecessary.
+    pub fn artifact_compression_options(
+        &self,
+    ) -> rustc_data_structures::artifact_compression::CompressionOptions {
+        let (level, chunk_size) = match self.artifact_compression_profile.as_str() {
+            "fast" => (-1, 256 * 1024),
+            "small" => (9, 1024 * 1024),
+            "legacy" => (3, 64 * 1024),
+            _ => (3, 256 * 1024),
+        };
+        rustc_data_structures::artifact_compression::CompressionOptions {
+            level: self.artifact_compression_level.unwrap_or(level),
+            chunk_size: self.artifact_compression_chunk_size.unwrap_or(chunk_size),
+        }
+    }
 }

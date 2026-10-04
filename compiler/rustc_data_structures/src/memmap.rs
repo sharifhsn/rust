@@ -1,10 +1,17 @@
 use std::fs::File;
 use std::io;
 use std::ops::{Deref, DerefMut};
+use std::path::Path;
 
-/// A trivial wrapper for [`memmap2::Mmap`] (or `Vec<u8>` on WASM).
+/// A file mapping, or owned decoded bytes for a compressed compiler artifact.
 #[cfg(not(any(miri, target_arch = "wasm32")))]
-pub struct Mmap(memmap2::Mmap);
+pub struct Mmap(MmapData);
+
+#[cfg(not(any(miri, target_arch = "wasm32")))]
+enum MmapData {
+    Mapped(memmap2::Mmap),
+    Decoded(Vec<u8>),
+}
 
 #[cfg(any(miri, target_arch = "wasm32"))]
 pub struct Mmap(Vec<u8>);
@@ -25,7 +32,11 @@ impl Mmap {
         // For more details see https://github.com/rust-lang/rust/issues/122262
         //
         // SAFETY: The caller must ensure that this is safe.
-        unsafe { memmap2::MmapOptions::new().map_copy_read_only(&file).map(Mmap) }
+        unsafe {
+            memmap2::MmapOptions::new()
+                .map_copy_read_only(&file)
+                .map(|mapping| Mmap(MmapData::Mapped(mapping)))
+        }
     }
 }
 
@@ -46,13 +57,53 @@ impl Deref for Mmap {
 
     #[inline]
     fn deref(&self) -> &[u8] {
-        &self.0
+        #[cfg(not(any(miri, target_arch = "wasm32")))]
+        {
+            match &self.0 {
+                MmapData::Mapped(mapping) => mapping,
+                MmapData::Decoded(bytes) => bytes,
+            }
+        }
+        #[cfg(any(miri, target_arch = "wasm32"))]
+        {
+            &self.0
+        }
     }
 }
 
 impl AsRef<[u8]> for Mmap {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self
+    }
+}
+
+impl Mmap {
+    /// Read a compiler artifact, accepting the experimental compressed format.
+    ///
+    /// Ordinary files keep their file-backed mapping. Compressed files currently
+    /// decode eagerly into owned memory: the compiler's metadata and
+    /// archive decoders require a stable, contiguous byte slice. This preserves
+    /// that contract, but does not implement lazy chunk loading.
+    ///
+    /// # Safety
+    ///
+    /// An ordinary file must not be mutated while its mapping is alive, as for
+    /// [`Mmap::map`]. The input must also remain unchanged while it is decoded.
+    pub unsafe fn map_artifact(path: &Path) -> io::Result<Self> {
+        if !crate::artifact_compression::is_compressed(path)? {
+            // SAFETY: the caller supplies the same immutable-file contract.
+            return unsafe { Self::map(File::open(path)?) };
+        }
+
+        let data = crate::artifact_compression::read_all(path)?;
+        #[cfg(not(any(miri, target_arch = "wasm32")))]
+        {
+            Ok(Mmap(MmapData::Decoded(data)))
+        }
+        #[cfg(any(miri, target_arch = "wasm32"))]
+        {
+            Ok(Mmap(data))
+        }
     }
 }
 
@@ -78,7 +129,7 @@ impl MmapMut {
     #[inline]
     pub fn make_read_only(self) -> std::io::Result<Mmap> {
         let mmap = self.0.make_read_only()?;
-        Ok(Mmap(mmap))
+        Ok(Mmap(MmapData::Mapped(mmap)))
     }
 }
 

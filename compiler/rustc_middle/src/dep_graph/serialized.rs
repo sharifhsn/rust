@@ -1,62 +1,47 @@
-//! The data that we will serialize and deserialize.
+//! The current session is recorded as a bounded sequential spool, so worker threads
+//! do not need to retain the whole graph. At finish, the spool is rewritten into
+//! stable-ID pages. Each page has a local fingerprint dictionary, compact edge
+//! encoding, checksum, and optional compression; a small manifest names the live
+//! pages. Unchanged pages are reused across incremental sessions, and holes left by
+//! removed nodes can be reclaimed or compacted.
 //!
-//! Notionally, the dep-graph is a sequence of NodeInfo with the dependencies
-//! specified inline. The total number of nodes and edges are stored as the last
-//! 16 bytes of the file, so we can find them easily at decoding time.
+//! The page layout reduces persistent bytes and rewrite work. Loading the previous
+//! graph reads only the manifest of page descriptors; pages are decoded on first access
+//! and stay cached until the session ends. The reverse lookup from a `DepNode` to its
+//! stable ID is built in memory from the pages on first use rather than persisted, since a
+//! recompiling crate loads every page anyway. Graph access returns copied nodes and edge
+//! iterators that own a shared backing buffer, so callers are not tied to the graph's
+//! lifetime.
 //!
-//! The serialisation is performed on-demand when each node is emitted. Using this
-//! scheme, we do not need to keep the current graph in memory.
-//!
-//! The deserialization is performed manually, in order to convert from the stored
-//! sequence of NodeInfos to the different arrays in SerializedDepGraph. Since the
-//! node and edge count are stored at the end of the file, all the arrays can be
-//! pre-allocated with the right length.
-//!
-//! The encoding of the dep-graph is generally designed around the fact that fixed-size
-//! reads of encoded data are generally faster than variable-sized reads. Ergo we adopt
-//! essentially the same varint encoding scheme used in the rmeta format; the edge lists
-//! for each node on the graph store a 2-bit integer which is the number of bytes per edge
-//! index in that node's edge list. We effectively ignore that an edge index of 0 could be
-//! encoded with 0 bytes in order to not require 3 bits to store the byte width of the edges.
-//! The overhead of calculating the correct byte width for each edge is mitigated by
-//! computing the max of the edge list once per node instead of per edge.
-//!
-//! When we decode this data, we do not immediately create [`SerializedDepNodeIndex`] and
-//! instead keep the data in its denser serialized form which lets us turn our on-disk size
-//! efficiency directly into a peak memory reduction. When we convert these encoded-in-memory
-//! values into their fully-deserialized type, we use a fixed-size read of the encoded array
-//! then mask off any errant bytes we read. The array of edge index bytes is padded to permit this.
-//!
-//! We also encode and decode the entire rest of each node using [`SerializedNodeHeader`]
-//! to let this encoding and decoding be done in one fixed-size operation. These headers contain
-//! two [`Fingerprint`]s along with the serialized [`DepKind`], and the number of edge indices
-//! in the node and the number of bytes used to encode the edge indices for this node. The
-//! [`DepKind`], number of edges, and bytes per edge are all bit-packed together, if they fit.
-//! If the number of edges in this node does not fit in the bits available in the header, we
-//! store it directly after the header with leb128.
-//!
-//! Dep-graph indices are bulk allocated to threads inside `LocalEncoderState`. Having threads
-//! own these indices helps avoid races when they are conditionally used when marking nodes green.
-//! It also reduces congestion on the shared index count.
+//! `SerializedNodeHeader` remains the fixed-size record format for the temporary
+//! spool. Dep-graph indices are bulk allocated to workers while recording so they
+//! do not contend on one shared counter.
 
 use std::cell::RefCell;
 use std::cmp::max;
+use std::fs::{self, File};
+use std::hash::Hasher;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::{iter, mem};
 
+use rustc_data_structures::artifact_compression::{self, CompressionOptions};
 use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::outline;
 use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_data_structures::sync::{AtomicU64, Lock, WorkerLocal, broadcast};
-use rustc_data_structures::unhash::UnhashMap;
-use rustc_index::{IndexSlice, IndexVec};
 use rustc_serialize::opaque::mem_encoder::MemEncoder;
-use rustc_serialize::opaque::{FileEncodeResult, FileEncoder, IntEncodedWithFixedSize, MemDecoder};
+use rustc_serialize::opaque::{
+    FileEncodeResult, FileEncoder, IntEncodedWithFixedSize, MAGIC_END_BYTES, MemDecoder,
+};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::Session;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::graph::{CurrentDepGraph, DepNodeColorMap, DesiredColor, TrySetColorResult};
 use super::retained::RetainedDepGraph;
@@ -71,19 +56,11 @@ rustc_index::newtype_index! {
     pub struct SerializedDepNodeIndex {}
 }
 
-impl SerializedDepNodeIndex {
-    /// Converts a current-session dep node index to a "serialized" index,
-    /// for the purpose of serializing data to be loaded by future sessions.
-    #[inline(always)]
-    pub fn from_curr_for_serialization(index: DepNodeIndex) -> Self {
-        SerializedDepNodeIndex::from_u32(index.as_u32())
-    }
-}
-
 const DEP_NODE_SIZE: usize = size_of::<SerializedDepNodeIndex>();
-/// Amount of padding we need to add to the edge list data so that we can retrieve every
-/// SerializedDepNodeIndex with a fixed-size read then mask.
-const DEP_NODE_PAD: usize = DEP_NODE_SIZE - 1;
+#[inline]
+fn mask(bits: usize) -> usize {
+    usize::MAX >> ((size_of::<usize>() * 8) - bits)
+}
 /// Number of bits we need to store the number of used bytes in a SerializedDepNodeIndex.
 /// Note that wherever we encode byte widths like this we actually store the number of bytes used
 /// minus 1; for a 4-byte value we technically would have 5 widths to store, but using one byte to
@@ -96,164 +73,83 @@ const DEP_NODE_WIDTH_BITS: usize = DEP_NODE_SIZE / 2;
 /// indices to threads.
 #[derive(Default)]
 pub struct SerializedDepGraph {
-    /// The set of all DepNodes in the graph
-    nodes: IndexVec<SerializedDepNodeIndex, DepNode>,
-    /// A value fingerprint associated with each [`DepNode`] in [`Self::nodes`],
-    /// typically a hash of the value returned by the node's query in the
-    /// previous incremental-compilation session.
-    ///
-    /// Some nodes don't have a meaningful value hash (e.g. queries with `no_hash`),
-    /// so they store a dummy value here instead (e.g. [`Fingerprint::ZERO`]).
-    value_fingerprints: IndexVec<SerializedDepNodeIndex, Fingerprint>,
-    /// For each DepNode, stores the list of edges originating from that
-    /// DepNode. Encoded as a [start, end) pair indexing into edge_list_data,
-    /// which holds the actual DepNodeIndices of the target nodes.
-    edge_list_indices: IndexVec<SerializedDepNodeIndex, EdgeHeader>,
-    /// A flattened list of all edge targets in the graph, stored in the same
-    /// varint encoding that we use on disk. Edge sources are implicit in edge_list_indices.
-    edge_list_data: Vec<u8>,
-    /// The lazily-built inverse of `nodes`: maps a [`DepNode`] back to its
-    /// [`SerializedDepNodeIndex`] via the node's key fingerprint. See
-    /// [`LazyNodeIndex`].
-    reverse_index: LazyNodeIndex,
+    /// Stable-ID pages, decoded on first access and cached for the session.
+    page_store: Option<Arc<GraphPageStore>>,
+    node_max: usize,
+    node_count: usize,
+    /// Maps a [`DepNode`] back to its [`SerializedDepNodeIndex`]; built on first use.
+    reverse_index: OnceLock<ReverseIndex>,
     /// The number of previous compilation sessions. This is used to generate
     /// unique anon dep nodes per session.
     session_count: u64,
-    /// Used to time the lazy per-`DepKind` reverse-index build. `None` only for
-    /// the empty default graph, which is never looked up.
-    profiler: Option<SelfProfilerRef>,
+    /// Raw-page fingerprints for the stable page files referenced by this graph.
+    /// The next generation uses them to leave identical hard-linked pages in
+    /// place instead of rewriting and recompressing them.
+    page_hashes: FxHashMap<u32, Fingerprint>,
 }
 
 // `SelfProfilerRef` is not `Debug`, so we can't derive this.
 impl std::fmt::Debug for SerializedDepGraph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SerializedDepGraph")
-            .field("nodes", &self.nodes)
-            .field("value_fingerprints", &self.value_fingerprints)
-            .field("edge_list_indices", &self.edge_list_indices)
-            .field("edge_list_data", &self.edge_list_data)
-            .field("reverse_index", &self.reverse_index)
+            .field("node_max", &self.node_max)
+            .field("node_count", &self.node_count)
             .field("session_count", &self.session_count)
+            .field("page_hashes", &self.page_hashes.len())
             .finish_non_exhaustive()
-    }
-}
-
-/// The inverse of [`SerializedDepGraph::nodes`], built lazily per [`DepKind`].
-///
-/// Only few nodes are ever looked up here, and those cluster into a handful of
-/// `DepKind`s. Building a map for every kind up front would be wasted work.
-#[derive(Debug, Default)]
-struct LazyNodeIndex {
-    /// All (non-`Null`) node indices, grouped into contiguous per-`DepKind`
-    /// ranges described by `kinds`. For any non-`Null` `DepKind` `k`, all values in
-    /// `nodes_by_kind[kinds[k].start..][..kinds[k].len]`
-    /// must be `Some` and have kind `k`.
-    nodes_by_kind: Vec<Option<SerializedDepNodeIndex>>,
-    /// For each `DepKind`, the range of `nodes_by_kind` holding its node indices
-    /// and the lazily-built fingerprint map over that range.
-    kinds: Vec<LazyKindIndex>,
-}
-
-#[derive(Debug, Default)]
-struct LazyKindIndex {
-    /// Offset into `LazyNodeIndex::nodes_by_kind` of this kind's first node.
-    start: u32,
-    /// Number of nodes of this kind.
-    len: u32,
-    /// `key_fingerprint -> node index`, built from this kind's range on first
-    /// lookup. Empty kinds (and kinds never looked up) never build a map.
-    map: OnceLock<UnhashMap<PackedFingerprint, SerializedDepNodeIndex>>,
-}
-
-impl LazyKindIndex {
-    /// Returns this kind's `key_fingerprint -> node index` map.
-    fn fingerprint_map(
-        &self,
-        kind: DepKind,
-        nodes: &IndexSlice<SerializedDepNodeIndex, DepNode>,
-        nodes_by_kind: &[Option<SerializedDepNodeIndex>],
-        profiler: &Option<SelfProfilerRef>,
-    ) -> &UnhashMap<PackedFingerprint, SerializedDepNodeIndex> {
-        self.map.get_or_init(|| {
-            let _prof_timer = profiler
-                .as_ref()
-                .map(|p| p.generic_activity("incr_comp_load_dep_graph_reverse_index"));
-            let range = (self.start as usize)..(self.start as usize + self.len as usize);
-            let mut map =
-                UnhashMap::with_capacity_and_hasher(self.len as usize, Default::default());
-            for &idx in &nodes_by_kind[range] {
-                let idx = idx.expect("counting sort fills every slot of a kind's range");
-                let node = nodes[idx];
-                debug_assert_eq!(node.kind, kind);
-                if map.insert(node.key_fingerprint, idx).is_some()
-                    // Side effect nodes can legitimately share a fingerprint.
-                    && node.kind != DepKind::SideEffect
-                {
-                    panic!(
-                        "Error: A dep graph node ({kind:?}) does not have an unique index. \
-                         Running a clean build on a nightly compiler with \
-                         `-Z incremental-verify-ich` can help narrow down the issue for reporting. \
-                         A clean build may also work around the issue.\n
-                         DepNode: {node:?}"
-                    )
-                }
-            }
-            map
-        })
     }
 }
 
 impl SerializedDepGraph {
     #[inline]
-    pub fn edge_targets_from(
-        &self,
-        source: SerializedDepNodeIndex,
-    ) -> impl Iterator<Item = SerializedDepNodeIndex> + Clone {
-        let header = self.edge_list_indices[source];
-        let mut raw = &self.edge_list_data[header.start()..];
-
-        let bytes_per_index = header.bytes_per_index();
-
-        // LLVM doesn't hoist EdgeHeader::mask so we do it ourselves.
-        let mask = header.mask();
-        (0..header.num_edges).map(move |_| {
-            // Doing this slicing in this order ensures that the first bounds check suffices for
-            // all the others.
-            let index = &raw[..DEP_NODE_SIZE];
-            raw = &raw[bytes_per_index..];
-            let index = u32::from_le_bytes(index.try_into().unwrap()) & mask;
-            SerializedDepNodeIndex::from_u32(index)
-        })
+    pub fn edge_targets_from(&self, source: SerializedDepNodeIndex) -> Option<GraphEdgeTargets> {
+        let page = self.page_store.as_ref()?.page_for_index(source)?;
+        let slot = (source.as_u32() % PAGE_NODE_CAPACITY) as u16;
+        let record = *page.node_for_slot(slot)?;
+        Some(GraphEdgeTargets::new(page, source.as_u32(), &record))
     }
 
     #[inline]
-    pub fn index_to_node(&self, dep_node_index: SerializedDepNodeIndex) -> &DepNode {
-        &self.nodes[dep_node_index]
+    pub fn index_to_node(&self, dep_node_index: SerializedDepNodeIndex) -> Option<DepNode> {
+        let page = self.page_store.as_ref()?.page_for_index(dep_node_index)?;
+        page.node_for_slot((dep_node_index.as_u32() % PAGE_NODE_CAPACITY) as u16)
+            .map(|record| record.node)
     }
 
     #[inline]
     pub fn node_to_index_opt(&self, dep_node: &DepNode) -> Option<SerializedDepNodeIndex> {
-        let kind = self.reverse_index.kinds.get(dep_node.kind.as_usize())?;
-        let map = kind.fingerprint_map(
-            dep_node.kind,
-            &self.nodes,
-            &self.reverse_index.nodes_by_kind,
-            &self.profiler,
-        );
-        map.get(&dep_node.key_fingerprint).copied()
+        let page_store = self.page_store.as_ref()?;
+        self.reverse_index
+            .get_or_init(|| ReverseIndex::build(page_store, self.node_count))
+            .index_for(dep_node, page_store)
     }
 
     #[inline]
     pub fn value_fingerprint_for_index(
         &self,
         dep_node_index: SerializedDepNodeIndex,
-    ) -> Fingerprint {
-        self.value_fingerprints[dep_node_index]
+    ) -> Option<Fingerprint> {
+        let page = self.page_store.as_ref()?.page_for_index(dep_node_index)?;
+        page.node_for_slot((dep_node_index.as_u32() % PAGE_NODE_CAPACITY) as u16)
+            .map(|record| record.value_fingerprint)
     }
 
     #[inline]
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.node_count
+    }
+
+    /// The length of the stable-ID space, including holes left by nodes removed
+    /// since the previous compilation. Consumers that index per-node state by
+    /// `SerializedDepNodeIndex` must size it to this value, not `node_count()`.
+    #[inline]
+    pub fn index_space_len(&self) -> usize {
+        self.node_max
+    }
+
+    #[inline]
+    fn node_max(&self) -> usize {
+        self.node_max
     }
 
     #[inline]
@@ -262,161 +158,1153 @@ impl SerializedDepGraph {
     }
 }
 
-/// A packed representation of an edge's start index and byte width.
-///
-/// This is packed by stealing 2 bits from the start index, which means we only accommodate edge
-/// data arrays up to a quarter of our address space. Which seems fine.
-#[derive(Debug, Clone, Copy)]
-struct EdgeHeader {
-    repr: usize,
-    num_edges: u32,
+const PAGED_GRAPH_MAGIC: &[u8; 8] = b"RSDGPG01";
+const PAGE_MAGIC: &[u8; 8] = b"RSDGPAG2";
+const PAGED_GRAPH_VERSION: u32 = 4;
+const PAGE_NODE_CAPACITY: u32 = 4096;
+const PAGE_FILE_PREFIX: &str = "dep-graph-page-";
+/// Reverse-index buckets written by earlier versions; removed when a session is saved.
+const LEGACY_INDEX_FILE_PREFIX: &str = "dep-graph-index-";
+const PAGE_HAS_VALUE_FINGERPRINT: u8 = 1;
+const PAGE_DELTA_EDGES: u8 = 2;
+const PAGE_EDGE_WIDTH_SHIFT: u8 = 2;
+const PAGE_EDGE_WIDTH_MASK: u8 = 0b1100;
+const PAGE_FLAGS_MASK: u8 = PAGE_HAS_VALUE_FINGERPRINT | PAGE_DELTA_EDGES | PAGE_EDGE_WIDTH_MASK;
+
+struct StableGraphIds {
+    current_to_stable: Vec<u32>,
+    stable_nodes: Vec<(u32, u32)>,
+    node_max: usize,
 }
 
-impl EdgeHeader {
-    #[inline]
-    fn start(self) -> usize {
-        self.repr >> DEP_NODE_WIDTH_BITS
+struct GraphSpoolIndex {
+    record_offsets: Vec<usize>,
+    node_count: usize,
+    edge_count: u64,
+    session_count: u64,
+}
+
+fn invalid_graph_spool() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid dep-graph spool")
+}
+
+fn invalid_graph_spool_for(reason: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("invalid dep-graph spool: {reason}"))
+}
+
+fn graph_page_path(dir: &Path, page_id: u32) -> PathBuf {
+    dir.join(format!("{PAGE_FILE_PREFIX}{page_id:08x}.bin"))
+}
+
+fn hash_page(bytes: &[u8]) -> Fingerprint {
+    let mut hasher = StableHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+fn edge_index_width(max_index: u32) -> usize {
+    if max_index == 0 { 1 } else { ((32 - max_index.leading_zeros()) as usize).div_ceil(8) }
+}
+
+fn unzigzag(value: u32) -> i64 {
+    ((value >> 1) as i64) ^ (-((value & 1) as i64))
+}
+
+fn index_legacy_stream(d: &mut MemDecoder<'_>) -> io::Result<GraphSpoolIndex> {
+    let trailer_len = 3 * IntEncodedWithFixedSize::ENCODED_SIZE;
+    let trailer_start = d.len().checked_sub(trailer_len).ok_or_else(invalid_graph_spool)?;
+    let (node_max, node_count, edge_count) = d.with_position(trailer_start, |d| {
+        (
+            IntEncodedWithFixedSize::decode(d).0 as usize,
+            IntEncodedWithFixedSize::decode(d).0 as usize,
+            IntEncodedWithFixedSize::decode(d).0 as usize,
+        )
+    });
+    if node_max > SerializedDepNodeIndex::MAX_AS_U32 as usize + 1 || node_count > node_max {
+        return Err(invalid_graph_spool());
     }
 
-    #[inline]
-    fn bytes_per_index(self) -> usize {
-        (self.repr & mask(DEP_NODE_WIDTH_BITS)) + 1
+    let mut record_offsets = vec![usize::MAX; node_max];
+    let mut kind_counts = vec![0u32; DepKind::MAX as usize + 1];
+    let mut actual_edges = 0usize;
+    for _ in 0..node_count {
+        let offset = d.position();
+        let header = SerializedNodeHeader { bytes: d.read_array() };
+        let index = header.index();
+        if index.as_usize() >= node_max || record_offsets[index.as_usize()] != usize::MAX {
+            return Err(invalid_graph_spool());
+        }
+        let node = header.node();
+        if node.kind == DepKind::Null {
+            return Err(invalid_graph_spool());
+        }
+        record_offsets[index.as_usize()] = offset;
+        kind_counts[node.kind.as_usize()] =
+            kind_counts[node.kind.as_usize()].checked_add(1).ok_or_else(invalid_graph_spool)?;
+
+        let num_edges = header.len().unwrap_or_else(|| d.read_u32()) as usize;
+        actual_edges = actual_edges.checked_add(num_edges).ok_or_else(invalid_graph_spool)?;
+        let edge_bytes = header
+            .bytes_per_index()
+            .checked_mul(num_edges)
+            .filter(|&len| len <= d.remaining())
+            .ok_or_else(invalid_graph_spool)?;
+        d.read_raw_bytes(edge_bytes);
     }
 
-    #[inline]
-    fn mask(self) -> u32 {
-        mask(self.bytes_per_index() * 8) as u32
+    for expected_count in kind_counts {
+        let encoded_count = read_graph_u32(d).map_err(|_| invalid_graph_spool())?;
+        if encoded_count != expected_count {
+            return Err(invalid_graph_spool());
+        }
+    }
+    let session_count = read_graph_u64(d).map_err(|_| invalid_graph_spool())?;
+    if d.remaining() != trailer_len || actual_edges != edge_count {
+        return Err(invalid_graph_spool());
+    }
+
+    Ok(GraphSpoolIndex { record_offsets, node_count, edge_count: edge_count as u64, session_count })
+}
+
+fn read_spool_u32(spool: &[u8], position: &mut usize) -> io::Result<u32> {
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *spool.get(*position).ok_or_else(invalid_graph_spool)?;
+        *position += 1;
+        if shift == 28 && byte > 0x0f {
+            return Err(invalid_graph_spool());
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return if shift == 0 || byte != 0 { Ok(value) } else { Err(invalid_graph_spool()) };
+        }
+    }
+    Err(invalid_graph_spool())
+}
+
+fn spool_node_record<'a>(
+    spool: &'a [u8],
+    offset: usize,
+) -> io::Result<(SerializedNodeHeader, u32, &'a [u8])> {
+    let header_end =
+        offset.checked_add(size_of::<SerializedNodeHeader>()).ok_or_else(invalid_graph_spool)?;
+    let bytes = spool.get(offset..header_end).ok_or_else(invalid_graph_spool)?;
+    let header = SerializedNodeHeader { bytes: bytes.try_into().unwrap() };
+    let mut edges_start = header_end;
+    let num_edges = match header.len() {
+        Some(len) => len,
+        None => read_spool_u32(spool, &mut edges_start)?,
+    };
+    let edge_bytes =
+        header.bytes_per_index().checked_mul(num_edges as usize).ok_or_else(invalid_graph_spool)?;
+    let edges_end = edges_start.checked_add(edge_bytes).ok_or_else(invalid_graph_spool)?;
+    let edges = spool.get(edges_start..edges_end).ok_or_else(invalid_graph_spool)?;
+    Ok((header, num_edges, edges))
+}
+
+fn assign_stable_graph_ids(
+    spool: &[u8],
+    graph: &GraphSpoolIndex,
+    previous: &SerializedDepGraph,
+) -> io::Result<StableGraphIds> {
+    let active_count = graph.node_count;
+    let old_node_max = previous.node_max();
+    let compact = old_node_max > active_count.saturating_mul(3) / 2 + PAGE_NODE_CAPACITY as usize;
+
+    let mut current_to_stable = vec![u32::MAX; graph.record_offsets.len()];
+    let mut occupied = vec![false; old_node_max.max(2)];
+    // Index 1 is the fixed `Red` node used by the graph algorithms. Index 0
+    // is not reserved: `AnonZeroDeps` has a session-specific key, and the old
+    // sentinel can coexist with the new one while it is promoted from the prior
+    // graph.
+    occupied[1] = true;
+
+    let mut fresh = Vec::new();
+    for (index, &offset) in graph.record_offsets.iter().enumerate() {
+        if offset == usize::MAX {
+            continue;
+        }
+        let (header, _, _) = spool_node_record(spool, offset)?;
+        let node = header.node();
+        if index == 1 && node.kind == DepKind::Red {
+            if current_to_stable[1] != u32::MAX {
+                return Err(invalid_graph_spool_for("multiple red nodes".into()));
+            }
+            current_to_stable[index] = 1;
+            continue;
+        }
+
+        if !compact && node.kind != DepKind::SideEffect {
+            if let Some(previous_index) = previous.node_to_index_opt(&node) {
+                let stable_id = previous_index.as_u32();
+                if stable_id == 1 || stable_id as usize >= occupied.len() {
+                    return Err(invalid_graph_spool_for(format!(
+                        "current ID {index} maps to reserved previous ID {stable_id} for {node:?}"
+                    )));
+                }
+                let slot = &mut occupied[stable_id as usize];
+                if *slot {
+                    return Err(invalid_graph_spool_for(format!(
+                        "multiple current records map to previous ID {stable_id} for {node:?}"
+                    )));
+                }
+                *slot = true;
+                current_to_stable[index] = stable_id;
+                continue;
+            }
+        }
+        fresh.push(index as u32);
+    }
+
+    // New IDs follow a depth-first post-order over the edges among new nodes, so a node's
+    // dependencies usually sit just before it and its edges encode as short deltas (graph
+    // pages ~12-17% smaller on sampled Bevy crates). Roots are visited in key order, which
+    // keeps IDs deterministic within a generation.
+    fresh.sort_unstable_by_key(|&index| {
+        let (header, _, _) = spool_node_record(spool, graph.record_offsets[index as usize])
+            .expect("records were validated while indexing the current graph");
+        let node = header.node();
+        (Fingerprint::from(node.key_fingerprint), node.kind.as_u16(), index)
+    });
+    let fresh = dependency_order(spool, &graph.record_offsets, &fresh)?;
+    let mut next_free = 0usize;
+    for index in fresh {
+        while next_free < occupied.len() && occupied[next_free] {
+            next_free += 1;
+        }
+        if next_free == occupied.len() {
+            occupied.push(true);
+        } else {
+            occupied[next_free] = true;
+        }
+        current_to_stable[index as usize] = next_free.try_into().unwrap();
+        next_free += 1;
+    }
+
+    let mut stable_nodes: Vec<_> = current_to_stable
+        .iter()
+        .enumerate()
+        .filter_map(|(current, &stable)| (stable != u32::MAX).then_some((stable, current as u32)))
+        .collect();
+    stable_nodes.sort_unstable_by_key(|&(stable, _)| stable);
+    if stable_nodes.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(invalid_graph_spool_for("stable IDs are not unique".into()));
+    }
+    let node_max = stable_nodes.last().map_or(2, |&(stable, _)| stable as usize + 1);
+    if node_max > SerializedDepNodeIndex::MAX_AS_U32 as usize + 1 {
+        return Err(invalid_graph_spool_for("stable index exceeds maximum value".into()));
+    }
+    Ok(StableGraphIds { current_to_stable, stable_nodes, node_max })
+}
+
+/// Orders `roots` (current indices) by an iterative depth-first post-order over the edges
+/// that stay within `roots`.
+fn dependency_order(spool: &[u8], record_offsets: &[usize], roots: &[u32]) -> io::Result<Vec<u32>> {
+    let mut in_set = vec![false; record_offsets.len()];
+    for &root in roots {
+        in_set[root as usize] = true;
+    }
+    let mut visited = vec![false; record_offsets.len()];
+    let mut order = Vec::with_capacity(roots.len());
+    // (node, next edge to visit)
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    for &root in roots {
+        if visited[root as usize] {
+            continue;
+        }
+        visited[root as usize] = true;
+        stack.push((root, 0));
+        while let Some(top) = stack.last_mut() {
+            let (node, next_edge) = *top;
+            let (header, num_edges, edges) =
+                spool_node_record(spool, record_offsets[node as usize])?;
+            if next_edge == num_edges {
+                order.push(node);
+                stack.pop();
+                continue;
+            }
+            top.1 += 1;
+            let width = header.bytes_per_index();
+            let mut target_bytes = [0u8; DEP_NODE_SIZE];
+            target_bytes[..width].copy_from_slice(&edges[next_edge as usize * width..][..width]);
+            let target = u32::from_le_bytes(target_bytes) as usize;
+            if in_set.get(target) == Some(&true) && !visited[target] {
+                visited[target] = true;
+                stack.push((target as u32, 0));
+            }
+        }
+    }
+    Ok(order)
+}
+
+fn encode_graph_page(
+    spool: &[u8],
+    record_offsets: &[usize],
+    ids: &StableGraphIds,
+    page_id: u32,
+    nodes: &[(u32, u32)],
+) -> io::Result<Vec<u8>> {
+    let mut fingerprints = Vec::with_capacity(nodes.len());
+    for &(_, current_index) in nodes {
+        let (header, _, _) = spool_node_record(spool, record_offsets[current_index as usize])?;
+        fingerprints.push(Fingerprint::from(header.node().key_fingerprint));
+    }
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    let use_dictionary = fingerprints.len() * 16 + nodes.len() * 2 < nodes.len() * 16;
+
+    let mut encoder = MemEncoder::new();
+    encoder.emit_raw_bytes(PAGE_MAGIC);
+    encoder.emit_u32(page_id);
+    encoder.emit_u32(nodes.len().try_into().unwrap());
+    encoder.emit_u32(if use_dictionary { fingerprints.len().try_into().unwrap() } else { 0 });
+    if use_dictionary {
+        for fingerprint in &fingerprints {
+            encoder.emit_raw_bytes(&fingerprint.to_le_bytes());
+        }
+    }
+
+    // Each field is stored as its own column (slots, kinds, flags, keys, value fingerprints,
+    // edge counts, edges). Grouping similar bytes compresses better than interleaved records.
+    let mut slots = Vec::with_capacity(nodes.len() * 2);
+    let mut kinds = Vec::with_capacity(nodes.len() * 2);
+    let mut flag_bytes = Vec::with_capacity(nodes.len());
+    let mut keys = Vec::with_capacity(nodes.len() * 2);
+    let mut values = Vec::new();
+    let mut counts = MemEncoder::new();
+    let mut edge_bytes = Vec::new();
+    for &(stable_id, current_index) in nodes {
+        let slot = stable_id % PAGE_NODE_CAPACITY;
+        let (header, num_edges, encoded_edges) =
+            spool_node_record(spool, record_offsets[current_index as usize])?;
+        let node = header.node();
+        let value_fingerprint = header.value_fingerprint();
+        let current_edge_width = header.bytes_per_index();
+        let mut edges = Vec::with_capacity(num_edges as usize);
+        for current_target in encoded_edges.chunks_exact(current_edge_width) {
+            let mut target_bytes = [0u8; DEP_NODE_SIZE];
+            target_bytes[..current_edge_width].copy_from_slice(current_target);
+            let target = u32::from_le_bytes(target_bytes);
+            let Some(&stable_target) = ids.current_to_stable.get(target as usize) else {
+                return Err(invalid_graph_spool());
+            };
+            if stable_target == u32::MAX {
+                return Err(invalid_graph_spool());
+            }
+            edges.push(stable_target);
+        }
+
+        let max_edge = edges.iter().copied().max().unwrap_or(0);
+        let fixed_width = edge_index_width(max_edge);
+        let fixed_len = fixed_width * edges.len();
+        let mut deltas = MemEncoder::new();
+        let mut previous_edge = stable_id;
+        for &edge in &edges {
+            let delta = edge as i64 - previous_edge as i64;
+            let zigzag = ((delta << 1) ^ (delta >> 63)) as u32;
+            deltas.emit_u32(zigzag);
+            previous_edge = edge;
+        }
+        let use_deltas = deltas.data.len() < fixed_len;
+
+        slots.extend_from_slice(&(slot as u16).to_le_bytes());
+        kinds.extend_from_slice(&node.kind.as_u16().to_le_bytes());
+        let mut flags =
+            if value_fingerprint == Fingerprint::ZERO { 0 } else { PAGE_HAS_VALUE_FINGERPRINT };
+        if use_deltas {
+            flags |= PAGE_DELTA_EDGES;
+        } else {
+            flags |= ((fixed_width - 1) as u8) << PAGE_EDGE_WIDTH_SHIFT;
+        }
+        flag_bytes.push(flags);
+
+        let key_fingerprint = Fingerprint::from(node.key_fingerprint);
+        if use_dictionary {
+            let key_index: u16 =
+                fingerprints.binary_search(&key_fingerprint).unwrap().try_into().unwrap();
+            keys.extend_from_slice(&key_index.to_le_bytes());
+        } else {
+            keys.extend_from_slice(&key_fingerprint.to_le_bytes());
+        }
+        if value_fingerprint != Fingerprint::ZERO {
+            values.extend_from_slice(&value_fingerprint.to_le_bytes());
+        }
+        counts.emit_u32(edges.len().try_into().unwrap());
+        if use_deltas {
+            edge_bytes.extend_from_slice(&deltas.data);
+        } else {
+            for edge in edges {
+                edge_bytes.extend_from_slice(&edge.to_le_bytes()[..fixed_width]);
+            }
+        }
+    }
+    for column in [&slots, &kinds, &flag_bytes, &keys, &values, &counts.data, &edge_bytes] {
+        encoder.emit_raw_bytes(column);
+    }
+
+    Ok(encoder.finish())
+}
+
+fn write_page_file(
+    path: &Path,
+    page_bytes: &[u8],
+    compression: Option<CompressionOptions>,
+) -> io::Result<()> {
+    let mut temp_path = path.to_path_buf();
+    temp_path.set_extension("part");
+    let mut file = File::create(&temp_path)?;
+    file.write_all(page_bytes)?;
+    file.write_all(MAGIC_END_BYTES)?;
+    drop(file);
+
+    if let Some(options) = compression {
+        artifact_compression::pack_with_options(&temp_path, options)?;
+    }
+
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn key_hash(kind: DepKind, fingerprint: Fingerprint) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write(&kind.as_u16().to_le_bytes());
+    hasher.write(&fingerprint.to_le_bytes());
+    let fingerprint: Fingerprint = hasher.finish();
+    let bytes = fingerprint.to_le_bytes();
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+}
+
+fn write_paged_graph(
+    graph_path: &Path,
+    graph_start: usize,
+    previous: &SerializedDepGraph,
+    compression: Option<CompressionOptions>,
+) -> io::Result<(usize, Vec<u32>)> {
+    // The first encoding is a bounded sequential spool. Indexing it retains only
+    // one offset per node; pages are encoded by reading records back from the
+    // mapping, without expanding the whole graph into temporary node and edge
+    // arrays.
+    // The graph is finalized while it is still at its private staging path. It is
+    // renamed to `dep-graph.bin` only after the query-cache IDs have been prepared.
+    let spool_path = graph_path;
+    // SAFETY: the spool is private to the active session and is not mutated
+    // until the mapping is dropped below.
+    let spool = unsafe { Mmap::map(File::open(&spool_path)?) }?;
+    let graph = {
+        let mut decoder =
+            MemDecoder::new(&spool, graph_start).map_err(|_| invalid_graph_spool())?;
+        index_legacy_stream(&mut decoder)
+            .map_err(|err| io::Error::new(err.kind(), format!("indexing graph spool: {err}")))?
+    };
+    let prefix = spool[..graph_start].to_vec();
+    let ids = assign_stable_graph_ids(&spool, &graph, previous)
+        .map_err(|err| io::Error::new(err.kind(), format!("assigning stable graph IDs: {err}")))?;
+    let stable_nodes = &ids.stable_nodes;
+
+    let parent = spool_path.parent().expect("dep-graph has a parent directory");
+    let mut page_hashes = FxHashMap::default();
+    let mut page_manifest = Vec::new();
+    let mut page_start = 0;
+    while page_start < stable_nodes.len() {
+        let page_id = stable_nodes[page_start].0 / PAGE_NODE_CAPACITY;
+        let mut page_end = page_start + 1;
+        while page_end < stable_nodes.len()
+            && stable_nodes[page_end].0 / PAGE_NODE_CAPACITY == page_id
+        {
+            page_end += 1;
+        }
+        let page_nodes = &stable_nodes[page_start..page_end];
+        let bytes = encode_graph_page(&spool, &graph.record_offsets, &ids, page_id, page_nodes)
+            .map_err(|err| io::Error::new(err.kind(), format!("encoding graph page: {err}")))?;
+        let page_edge_count = page_nodes.iter().try_fold(0u64, |total, &(_, current_index)| {
+            let (_, edges, _) =
+                spool_node_record(&spool, graph.record_offsets[current_index as usize])?;
+            total.checked_add(u64::from(edges)).ok_or_else(invalid_graph_spool)
+        })?;
+        let hash = hash_page(&bytes);
+        let page_path = graph_page_path(parent, page_id);
+        let unchanged = previous.page_hashes.get(&page_id) == Some(&hash) && page_path.is_file();
+        if !unchanged {
+            write_page_file(&page_path, &bytes, compression)?;
+        }
+        page_hashes.insert(page_id, hash);
+        page_manifest.push((
+            page_id,
+            page_nodes.len() as u32,
+            page_edge_count,
+            bytes.len() as u64,
+            hash,
+        ));
+        page_start = page_end;
+    }
+
+    // Remove pages that became unreachable in this graph, and reverse-index buckets from
+    // earlier versions. The session is still private; older published sessions retain their
+    // own hard links.
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let unreachable_page =
+            parse_graph_page_name(&name).is_some_and(|page_id| !page_hashes.contains_key(&page_id));
+        if unreachable_page || name.starts_with(LEGACY_INDEX_FILE_PREFIX) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+
+    let mut manifest = MemEncoder::new();
+    manifest.emit_raw_bytes(PAGED_GRAPH_MAGIC);
+    manifest.emit_u32(PAGED_GRAPH_VERSION);
+    manifest.emit_u32(ids.node_max.try_into().unwrap());
+    manifest.emit_u32(stable_nodes.len().try_into().unwrap());
+    manifest.emit_u64(graph.edge_count);
+    manifest.emit_u64(graph.session_count);
+    manifest.emit_u32(page_manifest.len().try_into().unwrap());
+    for (page_id, node_count, edge_count, raw_len, hash) in page_manifest {
+        manifest.emit_u32(page_id);
+        manifest.emit_u32(node_count);
+        manifest.emit_u64(edge_count);
+        manifest.emit_u64(raw_len);
+        manifest.emit_raw_bytes(&hash.to_le_bytes());
+    }
+
+    drop(spool);
+    let mut output = File::create(&spool_path)?;
+    output.write_all(&prefix)?;
+    output.write_all(&manifest.data)?;
+    output.write_all(MAGIC_END_BYTES)?;
+    output.flush()?;
+    let size = output
+        .metadata()?
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "dep graph exceeds usize"))?;
+    Ok((size, ids.current_to_stable))
+}
+
+fn parse_graph_page_name(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix(PAGE_FILE_PREFIX)?.strip_suffix(".bin")?;
+    if suffix.len() != 8 {
+        return None;
+    }
+    u32::from_str_radix(suffix, 16).ok()
+}
+
+struct GraphPageDecoder<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> GraphPageDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, ()> {
+        let bytes = bytes.strip_suffix(MAGIC_END_BYTES).ok_or(())?;
+        Ok(Self { bytes, position: 0 })
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.position
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ()> {
+        let end = self.position.checked_add(len).filter(|&end| end <= self.bytes.len()).ok_or(())?;
+        let bytes = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ()> {
+        Ok(self.read_bytes(1)?[0])
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ()> {
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.read_u8()?;
+            if shift == 28 && byte > 0x0f {
+                return Err(());
+            }
+            value |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return if shift == 0 || byte != 0 { Ok(value) } else { Err(()) };
+            }
+        }
+        Err(())
+    }
+
+    fn read_fingerprint(&mut self) -> Result<Fingerprint, ()> {
+        Ok(Fingerprint::from_le_bytes(self.read_bytes(16)?.try_into().unwrap()))
     }
 }
 
-#[inline]
-fn mask(bits: usize) -> usize {
-    usize::MAX >> ((size_of::<usize>() * 8) - bits)
+#[derive(Clone, Copy)]
+struct GraphPageDescriptor {
+    node_count: u32,
+    edge_count: u64,
+    raw_len: usize,
+    hash: Fingerprint,
+}
+
+#[derive(Clone, Copy)]
+struct GraphPageNode {
+    node: DepNode,
+    value_fingerprint: Fingerprint,
+    edge_start: usize,
+    edge_count: u32,
+    edge_width: u8,
+    delta_edges: bool,
+}
+
+struct DecodedGraphPage {
+    bytes: Mmap,
+    nodes: Vec<GraphPageNode>,
+    slot_to_position: Box<[u16]>,
+    resident_bytes: usize,
+}
+
+impl DecodedGraphPage {
+    fn node_for_slot(&self, slot: u16) -> Option<&GraphPageNode> {
+        let position = *self.slot_to_position.get(slot as usize)?;
+        (position != u16::MAX).then(|| &self.nodes[position as usize])
+    }
+}
+
+/// Pages decoded this session. Pages load on first use and stay until the session ends: a
+/// byte-limited LRU made recompiling a large crate thrash, because green-marking visits nodes
+/// across pages in dependency order (a Bevy library edit took 870 s with a 64 MiB limit and
+/// 12 s without one). Memory never exceeds the whole graph that an eager decoder would hold.
+#[derive(Default)]
+struct GraphPageCache {
+    pages: FxHashMap<u32, Arc<DecodedGraphPage>>,
+    invalid_pages: FxHashSet<u32>,
+    resident_bytes: usize,
+    page_loads: u64,
+    cache_hits: u64,
+}
+
+struct GraphPageStore {
+    page_dir: PathBuf,
+    node_max: usize,
+    pages: Vec<(u32, GraphPageDescriptor)>,
+    cache: Lock<GraphPageCache>,
+    profiler: SelfProfilerRef,
+}
+
+impl GraphPageStore {
+    fn descriptor(&self, page_id: u32) -> Option<GraphPageDescriptor> {
+        self.pages
+            .binary_search_by_key(&page_id, |(id, _)| *id)
+            .ok()
+            .map(|index| self.pages[index].1)
+    }
+
+    fn page_for_index(&self, index: SerializedDepNodeIndex) -> Option<Arc<DecodedGraphPage>> {
+        let raw = index.as_u32();
+        if raw as usize >= self.node_max {
+            return None;
+        }
+        self.load_page(raw / PAGE_NODE_CAPACITY)
+    }
+
+    #[allow(rustc::potential_query_instability)]
+    fn load_page(&self, page_id: u32) -> Option<Arc<DecodedGraphPage>> {
+        let descriptor = self.descriptor(page_id)?;
+        {
+            let mut cache = self.cache.lock();
+            if cache.invalid_pages.contains(&page_id) {
+                return None;
+            }
+            if let Some(page) = cache.pages.get(&page_id).map(Arc::clone) {
+                cache.cache_hits += 1;
+                return Some(page);
+            }
+        }
+
+        let page_path = graph_page_path(&self.page_dir, page_id);
+        // SAFETY: incremental-session locks make persisted pages immutable while they are read.
+        let decoded = unsafe { Mmap::map_artifact(&page_path) }
+            .map_err(|error| format!("cannot read page: {error}"))
+            .and_then(|bytes| decode_graph_page(bytes, page_id, descriptor, self.node_max));
+
+        let page = match decoded {
+            Ok(page) => Arc::new(page),
+            Err(error) => {
+                let mut cache = self.cache.lock();
+                if cache.invalid_pages.insert(page_id) {
+                    warn!(page_id, %error, "ignoring corrupt incremental dependency-graph page; affected queries will be recomputed");
+                }
+                return None;
+            }
+        };
+
+        let mut cache = self.cache.lock();
+        if cache.invalid_pages.contains(&page_id) {
+            return None;
+        }
+        // Another thread may have decoded the same page meanwhile; keep the first copy.
+        if let Some(existing) = cache.pages.get(&page_id) {
+            return Some(Arc::clone(existing));
+        }
+        cache.page_loads += 1;
+        cache.resident_bytes += page.resident_bytes;
+        cache.pages.insert(page_id, Arc::clone(&page));
+        Some(page)
+    }
+}
+
+/// Maps [`DepNode`] keys back to stable IDs. It is built from the pages on the first lookup
+/// instead of being persisted: a recompiling crate loads every page anyway (measured on Bevy,
+/// even for a touch), so a stored index only cost disk space.
+struct ReverseIndex {
+    /// Sorted key hashes, parallel to `indices`.
+    hashes: Box<[u64]>,
+    indices: Box<[u32]>,
+}
+
+impl ReverseIndex {
+    fn build(page_store: &GraphPageStore, node_count: usize) -> Self {
+        let _prof_timer =
+            page_store.profiler.generic_activity("incr_comp_build_dep_graph_reverse_index");
+        let mut entries = Vec::with_capacity(node_count);
+        for &(page_id, _) in &page_store.pages {
+            // Nodes on a corrupt page stay unresolvable; their queries are recomputed.
+            let Some(page) = page_store.load_page(page_id) else { continue };
+            for slot in 0..PAGE_NODE_CAPACITY as u16 {
+                if let Some(record) = page.node_for_slot(slot) {
+                    let hash = key_hash(record.node.kind, record.node.key_fingerprint.into());
+                    entries.push((hash, page_id * PAGE_NODE_CAPACITY + u32::from(slot)));
+                }
+            }
+        }
+        entries.sort_unstable();
+        let (hashes, indices) = entries.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        Self { hashes: hashes.into_boxed_slice(), indices: indices.into_boxed_slice() }
+    }
+
+    fn index_for(
+        &self,
+        node: &DepNode,
+        page_store: &GraphPageStore,
+    ) -> Option<SerializedDepNodeIndex> {
+        let fingerprint = Fingerprint::from(node.key_fingerprint);
+        let hash = key_hash(node.kind, fingerprint);
+        let start = self.hashes.partition_point(|&entry| entry < hash);
+        let end = start + self.hashes[start..].partition_point(|&entry| entry == hash);
+        let mut found = None;
+        for &stable_id in &self.indices[start..end] {
+            let dep_index = SerializedDepNodeIndex::from_u32(stable_id);
+            let Some(page) = page_store.page_for_index(dep_index) else { continue };
+            let slot = (stable_id % PAGE_NODE_CAPACITY) as u16;
+            let Some(candidate) = page.node_for_slot(slot).map(|record| record.node) else {
+                continue;
+            };
+            if candidate.kind == node.kind && candidate.key_fingerprint == node.key_fingerprint {
+                if found.is_some() && node.kind != DepKind::SideEffect {
+                    panic!(
+                        "Error: A dep graph node ({:?}) does not have a unique index. \
+                         Running a clean build on a nightly compiler with \
+                         `-Z incremental-verify-ich` can help narrow down the issue for reporting. \
+                         A clean build may also work around the issue.\n\nFingerprint: {fingerprint:?}",
+                        node.kind
+                    )
+                }
+                found = Some(dep_index);
+            }
+        }
+        found
+    }
+}
+
+impl Drop for GraphPageStore {
+    fn drop(&mut self) {
+        if std::env::var_os("RUSTC_INCREMENTAL_PAGE_STATS").is_none() {
+            return;
+        }
+        let cache = self.cache.lock();
+        eprintln!(
+            "RUSTC_INCREMENTAL_PAGE_CACHE {{\"pages\":{},\"loads\":{},\"hits\":{},\"invalid\":{},\"resident_bytes\":{}}}",
+            self.pages.len(),
+            cache.page_loads,
+            cache.cache_hits,
+            cache.invalid_pages.len(),
+            cache.resident_bytes,
+        );
+    }
+}
+
+fn decode_graph_page(
+    bytes: Mmap,
+    expected_page_id: u32,
+    descriptor: GraphPageDescriptor,
+    node_max: usize,
+) -> Result<DecodedGraphPage, String> {
+    let payload =
+        bytes.strip_suffix(MAGIC_END_BYTES).ok_or_else(|| "page footer is missing".to_owned())?;
+    if payload.len() != descriptor.raw_len || hash_page(payload) != descriptor.hash {
+        return Err("page checksum or length mismatch".to_owned());
+    }
+    let mut page = GraphPageDecoder::new(&bytes).map_err(|_| "invalid page footer".to_owned())?;
+    if page.read_bytes(PAGE_MAGIC.len()).map_err(|_| "truncated page header")? != PAGE_MAGIC
+        || page.read_u32().map_err(|_| "invalid page ID")? != expected_page_id
+    {
+        return Err("page header does not match manifest".to_owned());
+    }
+    let page_node_count = page.read_u32().map_err(|_| "missing page node count")?;
+    let dictionary_len = page.read_u32().map_err(|_| "missing dictionary length")? as usize;
+    if page_node_count == 0
+        || page_node_count > PAGE_NODE_CAPACITY
+        || page_node_count != descriptor.node_count
+        || dictionary_len > page_node_count as usize
+    {
+        return Err("invalid page node or dictionary count".to_owned());
+    }
+    let mut dictionary = Vec::with_capacity(dictionary_len);
+    for _ in 0..dictionary_len {
+        dictionary.push(page.read_fingerprint().map_err(|_| "truncated fingerprint dictionary")?);
+    }
+    if dictionary.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("fingerprint dictionary is not strictly sorted".to_owned());
+    }
+
+    let node_count = page_node_count as usize;
+    let key_width = if dictionary_len == 0 { 16 } else { 2 };
+    let slots = page.read_bytes(node_count * 2).map_err(|_| "truncated slot column")?;
+    let kinds = page.read_bytes(node_count * 2).map_err(|_| "truncated dep-kind column")?;
+    let flag_bytes = page.read_bytes(node_count).map_err(|_| "truncated flag column")?;
+    let keys = page.read_bytes(node_count * key_width).map_err(|_| "truncated key column")?;
+    let value_count =
+        flag_bytes.iter().filter(|&&flags| flags & PAGE_HAS_VALUE_FINGERPRINT != 0).count();
+    let values = page.read_bytes(value_count * 16).map_err(|_| "truncated value column")?;
+    let mut counts = Vec::with_capacity(node_count);
+    for _ in 0..node_count {
+        counts.push(page.read_u32().map_err(|_| "missing edge count")?);
+    }
+
+    let mut nodes = Vec::with_capacity(node_count);
+    let mut slot_to_position = vec![u16::MAX; PAGE_NODE_CAPACITY as usize];
+    let mut previous_slot = None;
+    let mut edge_count = 0u64;
+    let mut value_position = 0;
+    for position in 0..node_count {
+        let slot = u16::from_le_bytes([slots[position * 2], slots[position * 2 + 1]]);
+        if u32::from(slot) >= PAGE_NODE_CAPACITY
+            || previous_slot.is_some_and(|previous| slot <= previous)
+        {
+            return Err("page slots are not strictly increasing".to_owned());
+        }
+        previous_slot = Some(slot);
+        let raw_index = expected_page_id
+            .checked_mul(PAGE_NODE_CAPACITY)
+            .and_then(|id| id.checked_add(u32::from(slot)))
+            .ok_or_else(|| "page node ID overflow".to_owned())?;
+        if raw_index as usize >= node_max {
+            return Err("page node ID exceeds manifest bound".to_owned());
+        }
+        let kind_raw = u16::from_le_bytes([kinds[position * 2], kinds[position * 2 + 1]]);
+        if kind_raw > DepKind::MAX || kind_raw == DepKind::Null.as_u16() {
+            return Err("invalid dep-kind".to_owned());
+        }
+        let kind = DepKind::from_u16(kind_raw);
+        let flags = flag_bytes[position];
+        if flags & !PAGE_FLAGS_MASK != 0
+            || flags & PAGE_DELTA_EDGES != 0 && flags & PAGE_EDGE_WIDTH_MASK != 0
+        {
+            return Err("invalid node flags".to_owned());
+        }
+        let key = &keys[position * key_width..][..key_width];
+        let key_fingerprint = if dictionary_len == 0 {
+            Fingerprint::from_le_bytes(key.try_into().unwrap())
+        } else {
+            *dictionary
+                .get(u16::from_le_bytes([key[0], key[1]]) as usize)
+                .ok_or_else(|| "key dictionary index is out of bounds".to_owned())?
+        };
+        let value_fingerprint = if flags & PAGE_HAS_VALUE_FINGERPRINT != 0 {
+            let value = &values[value_position * 16..][..16];
+            value_position += 1;
+            Fingerprint::from_le_bytes(value.try_into().unwrap())
+        } else {
+            Fingerprint::ZERO
+        };
+        let num_edges = counts[position];
+        edge_count = edge_count
+            .checked_add(u64::from(num_edges))
+            .ok_or_else(|| "edge count overflow".to_owned())?;
+        if edge_count > descriptor.edge_count {
+            return Err("page edge count exceeds manifest".to_owned());
+        }
+        let edge_start = page.position();
+        let delta_edges = flags & PAGE_DELTA_EDGES != 0;
+        let edge_width = if delta_edges {
+            0
+        } else {
+            ((flags & PAGE_EDGE_WIDTH_MASK) >> PAGE_EDGE_WIDTH_SHIFT) + 1
+        };
+        let mut previous_edge = raw_index;
+        if delta_edges {
+            for _ in 0..num_edges {
+                let target = i64::from(previous_edge)
+                    .checked_add(unzigzag(page.read_u32().map_err(|_| "invalid delta edge")?))
+                    .ok_or_else(|| "delta edge overflow".to_owned())?;
+                if target < 0 || target >= node_max as i64 {
+                    return Err("delta edge points outside graph".to_owned());
+                }
+                previous_edge = target as u32;
+            }
+        } else {
+            let width = edge_width as usize;
+            if num_edges as usize > page.remaining() / width {
+                return Err("truncated fixed-width edge list".to_owned());
+            }
+            for _ in 0..num_edges {
+                let mut raw = [0; 4];
+                raw[..width].copy_from_slice(page.read_bytes(width).map_err(|_| "truncated edge")?);
+                if u32::from_le_bytes(raw) as usize >= node_max {
+                    return Err("edge points outside graph".to_owned());
+                }
+            }
+        }
+        slot_to_position[slot as usize] = nodes.len() as u16;
+        nodes.push(GraphPageNode {
+            node: DepNode { kind, key_fingerprint: key_fingerprint.into() },
+            value_fingerprint,
+            edge_start,
+            edge_count: num_edges,
+            edge_width,
+            delta_edges,
+        });
+    }
+    if page.remaining() != 0 || edge_count != descriptor.edge_count {
+        return Err("page payload does not match manifest counts".to_owned());
+    }
+    let resident_bytes = bytes.len()
+        + nodes.capacity() * mem::size_of::<GraphPageNode>()
+        + slot_to_position.len() * mem::size_of::<u16>();
+    Ok(DecodedGraphPage {
+        bytes,
+        nodes,
+        slot_to_position: slot_to_position.into_boxed_slice(),
+        resident_bytes,
+    })
+}
+
+#[derive(Clone)]
+pub struct GraphEdgeTargets {
+    page: Arc<DecodedGraphPage>,
+    position: usize,
+    remaining: u32,
+    width: u8,
+    delta: bool,
+    previous: u32,
+}
+
+impl GraphEdgeTargets {
+    fn new(page: Arc<DecodedGraphPage>, source: u32, node: &GraphPageNode) -> Self {
+        Self {
+            page,
+            position: node.edge_start,
+            remaining: node.edge_count,
+            width: node.edge_width,
+            delta: node.delta_edges,
+            previous: source,
+        }
+    }
+}
+
+impl Iterator for GraphEdgeTargets {
+    type Item = SerializedDepNodeIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let target = if self.delta {
+            let encoded = read_page_u32(&self.page.bytes, &mut self.position)
+                .expect("validated dependency graph delta edge");
+            (i64::from(self.previous) + unzigzag(encoded)) as u32
+        } else {
+            let width = self.width as usize;
+            let mut bytes = [0; 4];
+            bytes[..width].copy_from_slice(&self.page.bytes[self.position..self.position + width]);
+            self.position += width;
+            u32::from_le_bytes(bytes)
+        };
+        self.remaining -= 1;
+        self.previous = target;
+        Some(SerializedDepNodeIndex::from_u32(target))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for GraphEdgeTargets {}
+
+fn read_page_u32(bytes: &[u8], position: &mut usize) -> Option<u32> {
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes.get(*position)?;
+        *position += 1;
+        if shift == 28 && byte > 0x0f {
+            return None;
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return (shift == 0 || byte != 0).then_some(value);
+        }
+    }
+    None
+}
+
+fn read_graph_array<const N: usize>(d: &mut MemDecoder<'_>) -> Result<[u8; N], ()> {
+    if N > d.remaining() {
+        return Err(());
+    }
+    Ok(d.read_array())
+}
+
+fn read_graph_u8(d: &mut MemDecoder<'_>) -> Result<u8, ()> {
+    if d.remaining() == 0 {
+        return Err(());
+    }
+    Ok(d.read_u8())
+}
+
+fn read_graph_u32(d: &mut MemDecoder<'_>) -> Result<u32, ()> {
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = read_graph_u8(d)?;
+        if shift == 28 && byte > 0x0f {
+            return Err(());
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return if shift == 0 || byte != 0 { Ok(value) } else { Err(()) };
+        }
+    }
+    Err(())
+}
+
+fn read_graph_u64(d: &mut MemDecoder<'_>) -> Result<u64, ()> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = read_graph_u8(d)?;
+        if shift == 63 && byte > 1 {
+            return Err(());
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return if shift == 0 || byte != 0 { Ok(value) } else { Err(()) };
+        }
+    }
+    Err(())
+}
+
+fn decode_paged_graph(
+    d: &mut MemDecoder<'_>,
+    profiler: &SelfProfilerRef,
+    page_dir: &Path,
+) -> Result<Arc<SerializedDepGraph>, ()> {
+    if read_graph_array::<8>(d)? != *PAGED_GRAPH_MAGIC || read_graph_u32(d)? != PAGED_GRAPH_VERSION
+    {
+        return Err(());
+    }
+    let node_max = read_graph_u32(d)? as usize;
+    let node_count = read_graph_u32(d)? as usize;
+    let edge_count = read_graph_u64(d)?;
+    let session_count = read_graph_u64(d)?;
+    let page_count = read_graph_u32(d)? as usize;
+    if node_max > SerializedDepNodeIndex::MAX_AS_U32 as usize + 1
+        || node_count > node_max
+        || page_count > node_max.div_ceil(PAGE_NODE_CAPACITY as usize)
+        // Stable-ID compaction keeps the index space close to the live node count.
+        // Besides checking the writer's invariant, this prevents corrupt manifests
+        // from triggering unbounded array allocations before a page is inspected.
+        || node_max > node_count.saturating_mul(2).saturating_add(PAGE_NODE_CAPACITY as usize)
+        // The page descriptor has a 16-byte hash and four variable-width integers. The
+        // smallest valid descriptor is 20 bytes; bound allocation by bytes present.
+        || page_count > d.remaining() / 20
+    {
+        return Err(());
+    }
+
+    let mut pages = Vec::with_capacity(page_count);
+    let mut page_hashes = FxHashMap::default();
+    let mut actual_nodes = 0u64;
+    let mut actual_edges = 0u64;
+    let mut previous_page_id = None;
+
+    for _ in 0..page_count {
+        let page_id = read_graph_u32(d)?;
+        let page_node_count = read_graph_u32(d)?;
+        let page_edge_count = read_graph_u64(d)?;
+        let raw_len = usize::try_from(read_graph_u64(d)?).map_err(|_| ())?;
+        let expected_hash = Fingerprint::from_le_bytes(read_graph_array::<16>(d)?);
+        let first_id = (page_id as usize).checked_mul(PAGE_NODE_CAPACITY as usize).ok_or(())?;
+        if first_id >= node_max
+            || page_node_count == 0
+            || page_node_count > PAGE_NODE_CAPACITY
+            || previous_page_id.is_some_and(|previous| page_id <= previous)
+            || page_hashes.insert(page_id, expected_hash).is_some()
+        {
+            return Err(());
+        }
+        previous_page_id = Some(page_id);
+        actual_nodes = actual_nodes.checked_add(u64::from(page_node_count)).ok_or(())?;
+        actual_edges = actual_edges.checked_add(page_edge_count).ok_or(())?;
+        pages.push((
+            page_id,
+            GraphPageDescriptor {
+                node_count: page_node_count,
+                edge_count: page_edge_count,
+                raw_len,
+                hash: expected_hash,
+            },
+        ));
+    }
+
+    if actual_nodes != node_count as u64 || actual_edges != edge_count {
+        return Err(());
+    }
+    if d.remaining() != 0 {
+        return Err(());
+    }
+    let page_store = Arc::new(GraphPageStore {
+        page_dir: page_dir.to_owned(),
+        node_max,
+        pages,
+        cache: Lock::new(GraphPageCache::default()),
+        profiler: profiler.clone(),
+    });
+
+    Ok(Arc::new(SerializedDepGraph {
+        page_store: Some(page_store),
+        node_max,
+        node_count,
+        reverse_index: OnceLock::new(),
+        session_count,
+        page_hashes,
+    }))
 }
 
 impl SerializedDepGraph {
     #[instrument(level = "debug", skip(d, profiler))]
-    pub fn decode(d: &mut MemDecoder<'_>, profiler: &SelfProfilerRef) -> Arc<SerializedDepGraph> {
-        // The last 16 bytes are the node count and edge count.
-        debug!("position: {:?}", d.position());
-
-        // `node_max` is the number of indices including empty nodes while `node_count`
-        // is the number of actually encoded nodes.
-        let (node_max, node_count, edge_count) =
-            d.with_position(d.len() - 3 * IntEncodedWithFixedSize::ENCODED_SIZE, |d| {
-                debug!("position: {:?}", d.position());
-                let node_max = IntEncodedWithFixedSize::decode(d).0 as usize;
-                let node_count = IntEncodedWithFixedSize::decode(d).0 as usize;
-                let edge_count = IntEncodedWithFixedSize::decode(d).0 as usize;
-                (node_max, node_count, edge_count)
-            });
-        debug!("position: {:?}", d.position());
-
-        debug!(?node_count, ?edge_count);
-
-        let graph_bytes = d.len() - (3 * IntEncodedWithFixedSize::ENCODED_SIZE) - d.position();
-
-        let mut nodes = IndexVec::from_elem_n(
-            DepNode {
-                kind: DepKind::Null,
-                key_fingerprint: PackedFingerprint::from(Fingerprint::ZERO),
-            },
-            node_max,
-        );
-        let mut value_fingerprints = IndexVec::from_elem_n(Fingerprint::ZERO, node_max);
-        let mut edge_list_indices =
-            IndexVec::from_elem_n(EdgeHeader { repr: 0, num_edges: 0 }, node_max);
-
-        // This estimation assumes that all of the encoded bytes are for the edge lists or for the
-        // fixed-size node headers. But that's not necessarily true; if any edge list has a length
-        // that spills out of the size we can bit-pack into SerializedNodeHeader then some of the
-        // total serialized size is also used by leb128-encoded edge list lengths. Neglecting that
-        // contribution to graph_bytes means our estimation of the bytes needed for edge_list_data
-        // slightly overshoots. But it cannot overshoot by much; consider that the worse case is
-        // for a node with length 64, which means the spilled 1-byte leb128 length is 1 byte of at
-        // least (34 byte header + 1 byte len + 64 bytes edge data), which is ~1%. A 2-byte leb128
-        // length is about the same fractional overhead and it amortizes for yet greater lengths.
-        let mut edge_list_data =
-            Vec::with_capacity(graph_bytes - node_count * size_of::<SerializedNodeHeader>());
-
-        for _ in 0..node_count {
-            // Decode the header for this edge; the header packs together as many of the fixed-size
-            // fields as possible to limit the number of times we update decoder state.
-            let node_header = SerializedNodeHeader { bytes: d.read_array() };
-
-            let index = node_header.index();
-
-            let node = &mut nodes[index];
-            // Make sure there's no duplicate indices in the dep graph.
-            assert!(node_header.node().kind != DepKind::Null && node.kind == DepKind::Null);
-            *node = node_header.node();
-
-            value_fingerprints[index] = node_header.value_fingerprint();
-
-            // If the length of this node's edge list is small, the length is stored in the header.
-            // If it is not, we fall back to another decoder call.
-            let num_edges = node_header.len().unwrap_or_else(|| d.read_u32());
-
-            // The edges index list uses the same varint strategy as rmeta tables; we select the
-            // number of byte elements per-array not per-element. This lets us read the whole edge
-            // list for a node with one decoder call and also use the on-disk format in memory.
-            let edges_len_bytes = node_header.bytes_per_index() * (num_edges as usize);
-            // The in-memory structure for the edges list stores the byte width of the edges on
-            // this node with the offset into the global edge data array.
-            let edges_header = node_header.edges_header(&edge_list_data, num_edges);
-
-            edge_list_data.extend(d.read_raw_bytes(edges_len_bytes));
-
-            edge_list_indices[index] = edges_header;
-        }
-
-        // When we access the edge list data, we do a fixed-size read from the edge list data then
-        // mask off the bytes that aren't for that edge index, so the last read may dangle off the
-        // end of the array. This padding ensure it doesn't.
-        edge_list_data.extend(&[0u8; DEP_NODE_PAD]);
-
-        // Read the number of nodes of each dep kind, and perform
-        // counting sort for `LazyNodeIndex`.
-        let mut kinds = Vec::with_capacity(DepKind::MAX as usize + 1);
-        let mut offset = 0u32;
-        for _ in 0..(DepKind::MAX + 1) {
-            let len = d.read_u32();
-            kinds.push(LazyKindIndex { start: offset, len, map: OnceLock::new() });
-            offset += len;
-        }
-        debug_assert_eq!(offset as usize, node_count);
-
-        let session_count = d.read_u64();
-
-        // Counting sort: place each node index into its kind's range. `fill[k]`
-        // points at the next free slot in kind `k`'s range, so a kind's nodes end
-        // up contiguous. Slots start as `None` and are each filled exactly once
-        // (the counts sum to the number of non-`Null` nodes).
-        let mut nodes_by_kind = vec![None; node_count];
-        let mut fill: Vec<u32> = kinds.iter().map(|k| k.start).collect();
-        for (idx, node) in nodes.iter_enumerated() {
-            // Unused indices from batch allocation stay `Null`; they carry no
-            // encoded node and are never looked up by fingerprint, so skip them.
-            if node.kind == DepKind::Null {
-                continue;
-            }
-            let k = node.kind.as_usize();
-            nodes_by_kind[fill[k] as usize] = Some(idx);
-            fill[k] += 1;
-        }
-        // Each kind's range was filled exactly to its end.
-        debug_assert!(kinds.iter().zip(&fill).all(|(k, &f)| f == k.start + k.len));
-        let reverse_index = LazyNodeIndex { nodes_by_kind, kinds };
-
-        Arc::new(SerializedDepGraph {
-            nodes,
-            value_fingerprints,
-            edge_list_indices,
-            edge_list_data,
-            reverse_index,
-            session_count,
-            profiler: Some(profiler.clone()),
-        })
+    pub fn decode(
+        d: &mut MemDecoder<'_>,
+        profiler: &SelfProfilerRef,
+        page_dir: &Path,
+    ) -> Result<Arc<SerializedDepGraph>, ()> {
+        decode_paged_graph(d, profiler, page_dir)
     }
 }
 
@@ -550,14 +1438,6 @@ impl SerializedNodeHeader {
         let Unpacked { kind, key_fingerprint, .. } = self.unpack();
         DepNode { kind, key_fingerprint }
     }
-
-    #[inline]
-    fn edges_header(&self, edge_list_data: &[u8], num_edges: u32) -> EdgeHeader {
-        EdgeHeader {
-            repr: (edge_list_data.len() << DEP_NODE_WIDTH_BITS) | (self.bytes_per_index() - 1),
-            num_edges,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -621,6 +1501,9 @@ struct EncoderState {
     next_node_index: AtomicU64,
     previous: Arc<SerializedDepGraph>,
     file: Lock<Option<FileEncoder<'static>>>,
+    current_to_stable: OnceLock<Vec<u32>>,
+    graph_start: usize,
+    page_compression: Option<CompressionOptions>,
     local: WorkerLocal<RefCell<LocalEncoderState>>,
     stats: Option<Lock<FxHashMap<DepKind, Stat>>>,
 }
@@ -630,12 +1513,17 @@ impl EncoderState {
         encoder: FileEncoder<'static>,
         record_stats: bool,
         previous: Arc<SerializedDepGraph>,
+        page_compression: Option<CompressionOptions>,
     ) -> Self {
+        let graph_start = encoder.position();
         Self {
             previous,
             next_node_index: AtomicU64::new(0),
             stats: record_stats.then(|| Lock::new(FxHashMap::default())),
             file: Lock::new(Some(encoder)),
+            current_to_stable: OnceLock::new(),
+            graph_start,
+            page_compression,
             local: WorkerLocal::new(|_| {
                 RefCell::new(LocalEncoderState {
                     next_node_index: 0,
@@ -751,14 +1639,28 @@ impl EncoderState {
         edges: &[DepNodeIndex],
     ) {
         let node = NodeInfo {
-            node: *self.previous.index_to_node(prev_index),
-            value_fingerprint: self.previous.value_fingerprint_for_index(prev_index),
+            node: self
+                .previous
+                .index_to_node(prev_index)
+                .expect("a promoted previous dep node must have a readable page"),
+            value_fingerprint: self
+                .previous
+                .value_fingerprint_for_index(prev_index)
+                .expect("a promoted previous dep node must have a readable page"),
             edges,
         };
         self.encode_node(index, &node, retained_graph, local);
     }
 
     fn finish(&self, profiler: &SelfProfilerRef, current: &CurrentDepGraph) -> FileEncodeResult {
+        // `TyCtxt::finish` calls this after incremental persistence as a final
+        // cleanup step. The graph has already been finalized before the query
+        // cache is written so its indices can be remapped to the stable IDs in
+        // the graph pages.
+        if self.file.lock().is_none() {
+            return Ok(0);
+        }
+
         // Prevent more indices from being allocated.
         self.next_node_index.store(u32::MAX as u64 + 1, Ordering::SeqCst);
 
@@ -810,16 +1712,52 @@ impl EncoderState {
         IntEncodedWithFixedSize(edge_count.try_into().unwrap()).encode(&mut encoder);
         debug!("position: {:?}", encoder.position());
         // Drop the encoder so that nothing is written after the counts.
-        let result = encoder.finish();
-        if let Ok(position) = result {
+        let graph_path = encoder.path().to_path_buf();
+        let spool_result = encoder.finish();
+        drop(encoder);
+        let result = match spool_result {
+            Err(err) => Err(err),
+            Ok(_) => write_paged_graph(
+                &graph_path,
+                self.graph_start,
+                &self.previous,
+                self.page_compression,
+            )
+            .map_err(|err| (graph_path.clone(), err)),
+        };
+        let result = match result {
+            Ok((position, current_to_stable)) => {
+                self.current_to_stable
+                    .set(current_to_stable)
+                    .expect("dependency graph index mapping was already initialized");
+                Ok(position)
+            }
+            Err(err) => Err(err),
+        };
+        if let Ok(position) = &result {
             // FIXME(rylev): we hardcode the dep graph file name so we
             // don't need a dependency on rustc_incremental just for that.
-            profiler.artifact_size("dep_graph", "dep-graph.bin", position as u64);
+            profiler.artifact_size("dep_graph", "dep-graph.bin", *position as u64);
         }
 
         self.print_incremental_info(current, node_count, edge_count);
 
         result
+    }
+
+    fn serialized_index_for_cache(&self, index: DepNodeIndex) -> SerializedDepNodeIndex {
+        let mapping = self.current_to_stable.get().expect(
+            "dependency graph must be finalized before serializing the incremental query cache",
+        );
+        let stable_index = *mapping
+            .get(index.as_usize())
+            .expect("query cache references an unknown dependency graph index");
+        assert_ne!(
+            stable_index,
+            u32::MAX,
+            "query cache references an unused dependency graph index"
+        );
+        SerializedDepNodeIndex::from_u32(stable_index)
     }
 
     fn print_incremental_info(
@@ -900,7 +1838,17 @@ impl GraphEncoder {
             .unstable_opts
             .query_dep_graph
             .then(|| Lock::new(RetainedDepGraph::new(prev_node_count)));
-        let status = EncoderState::new(encoder, sess.opts.unstable_opts.incremental_info, previous);
+        let page_compression = sess
+            .opts
+            .unstable_opts
+            .compress_incremental
+            .then(|| sess.opts.unstable_opts.artifact_compression_options());
+        let status = EncoderState::new(
+            encoder,
+            sess.opts.unstable_opts.incremental_info,
+            previous,
+            page_compression,
+        );
         GraphEncoder { status, retained_graph, profiler: sess.prof.clone() }
     }
 
@@ -998,5 +1946,9 @@ impl GraphEncoder {
         let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph_finish");
 
         self.status.finish(&self.profiler, current)
+    }
+
+    pub(crate) fn serialized_index_for_cache(&self, index: DepNodeIndex) -> SerializedDepNodeIndex {
+        self.status.serialized_index_for_cache(index)
     }
 }
